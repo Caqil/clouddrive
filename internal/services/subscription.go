@@ -171,6 +171,11 @@ func (s *SubscriptionService) Subscribe(ctx context.Context, userID primitive.Ob
 		subscription.Metadata["coupon_code"] = req.CouponCode
 	}
 
+	// Store billing address if provided
+	if req.BillingAddress != nil {
+		subscription.Metadata["billing_address"] = *req.BillingAddress
+	}
+
 	// Create subscription with payment provider
 	switch req.PaymentMethod {
 	case "stripe":
@@ -614,30 +619,95 @@ func (s *SubscriptionService) UpdatePlan(ctx context.Context, planID primitive.O
 
 // GetSubscriptionStats returns subscription statistics
 func (s *SubscriptionService) GetSubscriptionStats(ctx context.Context) (map[string]interface{}, error) {
-	totalSubscriptions, _ := s.subscriptionRepo.List(ctx, &pkg.PaginationParams{Page: 1, Limit: 1})
-	activeSubscriptions, _ := s.subscriptionRepo.GetActiveSubscriptions(ctx)
-	trialingSubscriptions, _ := s.subscriptionRepo.GetSubscriptionsByStatus(ctx, models.SubscriptionStatusTrialing)
-	canceledSubscriptions, _ := s.subscriptionRepo.GetSubscriptionsByStatus(ctx, models.SubscriptionStatusCanceled)
+	// Get total subscription count using the count return value, not the slice length
+	_, totalCount, err := s.subscriptionRepo.List(ctx, &pkg.PaginationParams{Page: 1, Limit: 1})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get total subscriptions: %w", err)
+	}
+
+	activeSubscriptions, err := s.subscriptionRepo.GetActiveSubscriptions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get active subscriptions: %w", err)
+	}
+
+	trialingSubscriptions, err := s.subscriptionRepo.GetSubscriptionsByStatus(ctx, models.SubscriptionStatusTrialing)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get trialing subscriptions: %w", err)
+	}
+
+	canceledSubscriptions, err := s.subscriptionRepo.GetSubscriptionsByStatus(ctx, models.SubscriptionStatusCanceled)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get canceled subscriptions: %w", err)
+	}
+
+	// Calculate conversion rate
+	var conversionRate float64
+	if totalCount > 0 {
+		conversionRate = float64(len(activeSubscriptions)) / float64(totalCount) * 100
+	}
+
+	// Calculate churn rate (simplified)
+	var churnRate float64
+	if len(activeSubscriptions)+len(canceledSubscriptions) > 0 {
+		churnRate = float64(len(canceledSubscriptions)) / float64(len(activeSubscriptions)+len(canceledSubscriptions)) * 100
+	}
 
 	return map[string]interface{}{
-		"total_subscriptions":    len(totalSubscriptions),
+		"total_subscriptions":    totalCount,
 		"active_subscriptions":   len(activeSubscriptions),
 		"trialing_subscriptions": len(trialingSubscriptions),
 		"canceled_subscriptions": len(canceledSubscriptions),
+		"conversion_rate":        conversionRate,
+		"churn_rate":             churnRate,
 	}, nil
+}
+
+// GetSubscriptionsByPlan returns subscription count by plan
+func (s *SubscriptionService) GetSubscriptionsByPlan(ctx context.Context) (map[string]interface{}, error) {
+	plans, err := s.subscriptionRepo.GetActivePlans(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	planStats := make(map[string]interface{})
+
+	for _, plan := range plans {
+		// Get subscriptions for this plan
+		params := &pkg.PaginationParams{
+			Page:  1,
+			Limit: 1,
+			Filter: map[string]interface{}{
+				"plan_id": plan.ID,
+				"status":  models.SubscriptionStatusActive,
+			},
+		}
+		_, count, err := s.subscriptionRepo.List(ctx, params)
+		if err != nil {
+			continue
+		}
+
+		planStats[plan.Name] = map[string]interface{}{
+			"plan_id":     plan.ID,
+			"subscribers": count,
+			"price":       plan.Price,
+			"currency":    plan.Currency,
+		}
+	}
+
+	return planStats, nil
 }
 
 // Helper Methods
 
 // isPlanBillingCycleSupported checks if billing cycle is supported by plan
-func (s *SubscriptionService) isPlanBillingCycleSupported(plan *models.SubscriptionPlan, cycle models.BillingCycle) bool {
+func (s *SubscriptionService) isPlanBillingCycleSupported(_ *models.SubscriptionPlan, cycle models.BillingCycle) bool {
 	// You can implement specific logic here based on plan features
 	// For now, assume all plans support monthly and yearly
 	return cycle == models.BillingCycleMonthly || cycle == models.BillingCycleYearly
 }
 
 // calculateSubscriptionPricing calculates final pricing with discounts
-func (s *SubscriptionService) calculateSubscriptionPricing(ctx context.Context, plan *models.SubscriptionPlan, cycle models.BillingCycle, couponCode string) (int64, int64, error) {
+func (s *SubscriptionService) calculateSubscriptionPricing(_ context.Context, plan *models.SubscriptionPlan, cycle models.BillingCycle, couponCode string) (int64, int64, error) {
 	baseAmount := plan.Price
 	discountAmount := int64(0)
 
@@ -651,9 +721,17 @@ func (s *SubscriptionService) calculateSubscriptionPricing(ctx context.Context, 
 	if couponCode != "" {
 		// This would integrate with your coupon system
 		// For now, apply a simple discount
-		if couponCode == "SAVE20" {
+		switch couponCode {
+		case "SAVE20":
 			additionalDiscount := baseAmount / 5 // 20% discount
 			discountAmount += additionalDiscount
+		case "SAVE10":
+			additionalDiscount := baseAmount / 10 // 10% discount
+			discountAmount += additionalDiscount
+		case "FIRSTMONTH":
+			if cycle == models.BillingCycleMonthly {
+				discountAmount += baseAmount // First month free
+			}
 		}
 	}
 
@@ -690,7 +768,7 @@ func (s *SubscriptionService) getSubscriptionUsage(ctx context.Context, userID p
 }
 
 // calculateProration calculates proration amount for plan changes
-func (s *SubscriptionService) calculateProration(subscription *models.Subscription, oldPlan, newPlan *models.SubscriptionPlan) int64 {
+func (s *SubscriptionService) calculateProration(subscription *models.Subscription, _ *models.SubscriptionPlan, newPlan *models.SubscriptionPlan) int64 {
 	// Calculate remaining days in current period
 	now := time.Now()
 	totalDays := subscription.CurrentPeriodEnd.Sub(subscription.CurrentPeriodStart).Hours() / 24
@@ -718,10 +796,10 @@ func (s *SubscriptionService) revertToFreePlan(ctx context.Context, userID primi
 	s.userRepo.Update(ctx, userID, updates)
 }
 
-// Payment Provider Integration Methods (Enhanced)
+// Payment Provider Integration Methods
 
 // createStripeSubscription creates subscription with Stripe
-func (s *SubscriptionService) createStripeSubscription(ctx context.Context, subscription *models.Subscription, plan *models.SubscriptionPlan, user *models.User, req *CreateSubscriptionRequest) error {
+func (s *SubscriptionService) createStripeSubscription(_ context.Context, subscription *models.Subscription, _ *models.SubscriptionPlan, _ *models.User, req *CreateSubscriptionRequest) error {
 	// In a real implementation, this would integrate with Stripe API
 	// Create customer if doesn't exist
 	customerToken, err := pkg.GenerateRandomToken(14)
@@ -742,14 +820,14 @@ func (s *SubscriptionService) createStripeSubscription(ctx context.Context, subs
 
 	// Store billing address if provided
 	if req.BillingAddress != nil {
-		subscription.BillingAddress = *req.BillingAddress
+		subscription.Metadata["billing_address"] = *req.BillingAddress
 	}
 
 	return nil
 }
 
 // createPayPalSubscription creates subscription with PayPal
-func (s *SubscriptionService) createPayPalSubscription(ctx context.Context, subscription *models.Subscription, plan *models.SubscriptionPlan, user *models.User, req *CreateSubscriptionRequest) error {
+func (s *SubscriptionService) createPayPalSubscription(_ context.Context, subscription *models.Subscription, _ *models.SubscriptionPlan, _ *models.User, _ *CreateSubscriptionRequest) error {
 	// In a real implementation, this would integrate with PayPal API
 	subscriptionToken, err := pkg.GenerateRandomToken(10)
 	if err != nil {
@@ -762,37 +840,37 @@ func (s *SubscriptionService) createPayPalSubscription(ctx context.Context, subs
 }
 
 // updateStripeSubscription updates Stripe subscription
-func (s *SubscriptionService) updateStripeSubscription(ctx context.Context, subscription *models.Subscription, newPlan *models.SubscriptionPlan, req *UpgradeDowngradeRequest) error {
+func (s *SubscriptionService) updateStripeSubscription(_ context.Context, _ *models.Subscription, _ *models.SubscriptionPlan, _ *UpgradeDowngradeRequest) error {
 	// Stripe API integration would go here
 	return nil
 }
 
 // updatePayPalSubscription updates PayPal subscription
-func (s *SubscriptionService) updatePayPalSubscription(ctx context.Context, subscription *models.Subscription, newPlan *models.SubscriptionPlan, req *UpgradeDowngradeRequest) error {
+func (s *SubscriptionService) updatePayPalSubscription(_ context.Context, _ *models.Subscription, _ *models.SubscriptionPlan, _ *UpgradeDowngradeRequest) error {
 	// PayPal API integration would go here
 	return nil
 }
 
 // cancelStripeSubscription cancels Stripe subscription
-func (s *SubscriptionService) cancelStripeSubscription(ctx context.Context, subscription *models.Subscription, atPeriodEnd bool) error {
+func (s *SubscriptionService) cancelStripeSubscription(_ context.Context, _ *models.Subscription, _ bool) error {
 	// Stripe API call to cancel subscription
 	return nil
 }
 
 // cancelPayPalSubscription cancels PayPal subscription
-func (s *SubscriptionService) cancelPayPalSubscription(ctx context.Context, subscription *models.Subscription) error {
+func (s *SubscriptionService) cancelPayPalSubscription(_ context.Context, _ *models.Subscription) error {
 	// PayPal API call to cancel subscription
 	return nil
 }
 
 // reactivateStripeSubscription reactivates Stripe subscription
-func (s *SubscriptionService) reactivateStripeSubscription(ctx context.Context, subscription *models.Subscription) error {
+func (s *SubscriptionService) reactivateStripeSubscription(_ context.Context, _ *models.Subscription) error {
 	// Stripe API call to reactivate subscription
 	return nil
 }
 
 // reactivatePayPalSubscription reactivates PayPal subscription
-func (s *SubscriptionService) reactivatePayPalSubscription(ctx context.Context, subscription *models.Subscription) error {
+func (s *SubscriptionService) reactivatePayPalSubscription(_ context.Context, _ *models.Subscription) error {
 	// PayPal API call to reactivate subscription
 	return nil
 }
@@ -1060,7 +1138,7 @@ The CloudDrive Team
 }
 
 // sendRenewalFailureNotification sends renewal failure notification
-func (s *SubscriptionService) sendRenewalFailureNotification(ctx context.Context, subscription *models.Subscription, err error) {
+func (s *SubscriptionService) sendRenewalFailureNotification(ctx context.Context, subscription *models.Subscription, _ error) {
 	user, userErr := s.userRepo.GetByID(ctx, subscription.UserID)
 	if userErr != nil {
 		return
