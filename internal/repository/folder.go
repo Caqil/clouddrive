@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"clouddrive/internal/models"
-	"clouddrive/internal/pkg"
+	"github.com/Caqil/clouddrive/internal/models"
+	"github.com/Caqil/clouddrive/internal/pkg"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
