@@ -36,14 +36,14 @@ func NewAnalyticsService(
 
 // DashboardStats represents dashboard statistics
 type DashboardStats struct {
-	TotalUsers     int64              `json:"totalUsers"`
-	ActiveUsers    int64              `json:"activeUsers"`
-	TotalFiles     int64              `json:"totalFiles"`
-	TotalStorage   int64              `json:"totalStorage"`
-	TotalRevenue   int64              `json:"totalRevenue"`
-	GrowthRate     float64            `json:"growthRate"`
-	StorageUsage   float64            `json:"storageUsage"`
-	RecentActivity []models.Analytics `json:"recentActivity"`
+	TotalUsers     int64               `json:"totalUsers"`
+	ActiveUsers    int64               `json:"activeUsers"`
+	TotalFiles     int64               `json:"totalFiles"`
+	TotalStorage   int64               `json:"totalStorage"`
+	TotalRevenue   int64               `json:"totalRevenue"`
+	GrowthRate     float64             `json:"growthRate"`
+	StorageUsage   float64             `json:"storageUsage"`
+	RecentActivity []*models.Analytics `json:"recentActivity"` // Fixed: Changed to pointer slice
 }
 
 // UserAnalyticsData represents user analytics data
@@ -142,7 +142,7 @@ func (s *AnalyticsService) GetDashboardStats(ctx context.Context) (*DashboardSta
 		TotalRevenue:   totalRevenue,
 		GrowthRate:     growthRate,
 		StorageUsage:   float64(totalStorage) / (1024 * 1024 * 1024), // GB
-		RecentActivity: recentActivity,
+		RecentActivity: recentActivity,                               // Fixed: Now matches the pointer slice type
 	}, nil
 }
 
@@ -277,7 +277,7 @@ func (s *AnalyticsService) GenerateDailySummary(ctx context.Context, date time.T
 	}
 
 	// Save or update summary
-	if existing, err := s.analyticsRepo.GetSummaryByDate(ctx, date); err == nil {
+	if _, err := s.analyticsRepo.GetSummaryByDate(ctx, date); err == nil {
 		// Update existing summary
 		updates := map[string]interface{}{
 			"active_users":     summary.ActiveUsers,
@@ -366,7 +366,7 @@ func (s *AnalyticsService) generateUserAnalytics(ctx context.Context, date time.
 		}
 
 		// Check if user analytics already exists for this date
-		if existing, err := s.analyticsRepo.GetUserAnalyticsByDate(ctx, user.ID, date); err == nil {
+		if _, err := s.analyticsRepo.GetUserAnalyticsByDate(ctx, user.ID, date); err == nil {
 			// Update existing
 			updates := map[string]interface{}{
 				"files_uploaded":   userAnalytics.FilesUploaded,

@@ -130,6 +130,18 @@ func (s *FileService) UploadFile(ctx context.Context, userID primitive.ObjectID,
 		VirusScanStatus: models.ScanPending,
 	}
 
+	// Use upload result data if available
+	if uploadResult != nil {
+		// Store the actual uploaded size if different
+		if uploadResult.Size > 0 {
+			file.Size = uploadResult.Size
+		}
+		// Store ETag for integrity verification
+		if uploadResult.ETag != "" {
+			file.Checksum = uploadResult.ETag
+		}
+	}
+
 	// Detect and set MIME type if not provided
 	if file.MimeType == "" {
 		file.MimeType = pkg.Files.GetMimeType(req.FileHeader.Filename)

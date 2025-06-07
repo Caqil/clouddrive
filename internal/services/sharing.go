@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Caqil/clouddrive/internal/models"
@@ -14,6 +15,7 @@ import (
 
 // SharingService handles file and folder sharing
 type SharingService struct {
+	userRepo      repository.UserRepository
 	shareRepo     repository.ShareRepository
 	fileRepo      repository.FileRepository
 	folderRepo    repository.FolderRepository
@@ -104,6 +106,9 @@ func (s *SharingService) CreateShare(ctx context.Context, userID primitive.Objec
 		return nil, pkg.ErrInternalServer.WithCause(err)
 	}
 
+	// Build share URL
+	shareURL := fmt.Sprintf("/share/%s", token)
+
 	// Hash password if provided
 	var hashedPassword string
 	if req.Password != "" {
@@ -148,13 +153,39 @@ func (s *SharingService) CreateShare(ctx context.Context, userID primitive.Objec
 
 	// Send share notifications
 	if len(req.Recipients) > 0 {
-		shareURL := fmt.Sprintf("/share/%s", token)
 		for _, email := range req.Recipients {
-			message := fmt.Sprintf("A file has been shared with you: %s", resourceName)
+			// Prepare notification message
+			message := fmt.Sprintf("A %s has been shared with you: %s\n\nAccess it here: %s",
+				req.ResourceType, resourceName, shareURL)
+
+			// Use custom message if provided
 			if req.CustomMessage != "" {
-				message = req.CustomMessage
+				message = fmt.Sprintf("%s\n\nMessage from sender: %s\n\nAccess it here: %s",
+					req.CustomMessage, resourceName, shareURL)
 			}
-			s.emailService.SendNotificationEmail(ctx, email, "File Shared", message)
+
+			// Add password hint if share is password protected
+			if req.Password != "" {
+				message += "\n\nNote: This share is password protected. The sender should provide you with the password separately."
+			}
+
+			// Add expiration info if set
+			if req.ExpiresAt != nil {
+				message += fmt.Sprintf("\n\nThis share will expire on: %s",
+					req.ExpiresAt.Format("2006-01-02 15:04:05 UTC"))
+			}
+
+			// Send notification email asynchronously
+			go func(recipientEmail string) {
+				if err := s.emailService.SendNotificationEmail(ctx, recipientEmail,
+					fmt.Sprintf("%s Shared: %s", strings.Title(string(req.ResourceType)), resourceName),
+					message); err != nil {
+					// Log email sending error but don't fail the share creation
+					s.logAuditEvent(ctx, userID, models.AuditActionShareCreate, "email",
+						primitive.NilObjectID, false,
+						fmt.Sprintf("Failed to send share notification to %s: %v", recipientEmail, err))
+				}
+			}(email)
 		}
 	}
 
@@ -166,7 +197,7 @@ func (s *SharingService) CreateShare(ctx context.Context, userID primitive.Objec
 
 	return &ShareResponse{
 		Share:        share,
-		ShareURL:     fmt.Sprintf("/share/%s", token),
+		ShareURL:     shareURL,
 		ResourceName: resourceName,
 	}, nil
 }
@@ -244,32 +275,184 @@ func (s *SharingService) AccessShare(ctx context.Context, token, password, ip, u
 			}
 		}
 		if !allowed {
-			return nil, pkg.ErrForbidden
+			return nil, pkg.ErrForbidden.WithDetails(map[string]interface{}{
+				"message": "Access denied: IP address not allowed",
+			})
 		}
 	}
 
-	// Log access
+	// Check domain restrictions (extract domain from user agent or referrer)
+	if len(share.AllowedDomains) > 0 {
+		// Extract domain from IP or implement domain checking logic
+		// This could be enhanced to check the referrer header or implement
+		// more sophisticated domain validation
+		allowed := false
+
+		// For now, we'll check if the user agent contains allowed domains
+		// In a real implementation, you might want to check the referrer header
+		// or implement reverse DNS lookup for IP-to-domain mapping
+		userAgentLower := strings.ToLower(userAgent)
+		for _, allowedDomain := range share.AllowedDomains {
+			if strings.Contains(userAgentLower, strings.ToLower(allowedDomain)) {
+				allowed = true
+				break
+			}
+		}
+
+		if !allowed {
+			return nil, pkg.ErrForbidden.WithDetails(map[string]interface{}{
+				"message": "Access denied: Domain not allowed",
+			})
+		}
+	}
+
+	// Extract additional info from user agent for better tracking
+	var country, city string
+	// In a real implementation, you might use a GeoIP service like MaxMind
+	// to get location information from the IP address
+	// For now, we'll leave these empty or use placeholder values
+	if ip != "" {
+		// Placeholder for GeoIP lookup
+		// country, city = geoIPLookup(ip)
+	}
+
+	// Log access with enhanced information
 	access := models.ShareAccess{
 		IP:         ip,
 		UserAgent:  userAgent,
+		Country:    country,
+		City:       city,
 		AccessedAt: time.Now(),
 		Action:     "view",
 	}
 
-	s.shareRepo.AddAccessLog(ctx, share.ID, access)
-	s.shareRepo.UpdateViewCount(ctx, share.ID)
+	// Add access log and update view count
+	if err := s.shareRepo.AddAccessLog(ctx, share.ID, access); err != nil {
+		// Log error but don't fail the request
+		s.logAuditEvent(ctx, share.UserID, models.AuditActionShareAccess, "share", share.ID, false, fmt.Sprintf("Failed to log access: %v", err))
+	}
+
+	if err := s.shareRepo.UpdateViewCount(ctx, share.ID); err != nil {
+		// Log error but don't fail the request
+		s.logAuditEvent(ctx, share.UserID, models.AuditActionShareAccess, "share", share.ID, false, fmt.Sprintf("Failed to update view count: %v", err))
+	}
 
 	// Send notification if enabled
 	if share.NotifyOnAccess {
-		message := fmt.Sprintf("Your shared file '%s' was accessed", share.ResourceName)
-		// Get share owner and send notification
-		// This would require getting user email - simplified for brevity
+		// Get share owner information
+		shareOwner, err := s.userRepo.GetByID(ctx, share.UserID)
+		if err != nil {
+			// Log error but don't fail the share access
+			s.logAuditEvent(ctx, share.UserID, models.AuditActionShareAccess, "share", share.ID, false, fmt.Sprintf("Failed to get share owner for notification: %v", err))
+		} else {
+			// Get resource name for the notification
+			var resourceName string
+			switch share.ResourceType {
+			case models.ShareResourceFile:
+				if file, err := s.fileRepo.GetByID(ctx, share.ResourceID); err == nil {
+					resourceName = file.Name
+				}
+			case models.ShareResourceFolder:
+				if folder, err := s.folderRepo.GetByID(ctx, share.ResourceID); err == nil {
+					resourceName = folder.Name
+				}
+			}
+
+			// Send notification email
+			subject := "Share Access Notification"
+			message := fmt.Sprintf(
+				"Your shared %s '%s' was accessed.\n\n"+
+					"Access Details:\n"+
+					"- Time: %s\n"+
+					"- IP Address: %s\n"+
+					"- User Agent: %s\n"+
+					"- Location: %s, %s\n\n"+
+					"If this was not expected, you can revoke the share link in your dashboard.",
+				share.ResourceType,
+				resourceName,
+				access.AccessedAt.Format("2006-01-02 15:04:05 UTC"),
+				ip,
+				userAgent,
+				city,
+				country,
+			)
+
+			// Send notification asynchronously to not block the share access
+			go func() {
+				if err := s.emailService.SendNotificationEmail(context.Background(), shareOwner.Email, subject, message); err != nil {
+					// Log email sending error
+					s.logAuditEvent(context.Background(), share.UserID, models.AuditActionShareAccess, "share", share.ID, false, fmt.Sprintf("Failed to send access notification: %v", err))
+				}
+			}()
+		}
 	}
 
 	// Track analytics
 	s.trackAnalytics(ctx, primitive.NilObjectID, models.EventTypeShareAccess, "view", share.ResourceID, share.ResourceName)
 
+	// Log successful access in audit log
+	s.logAuditEvent(ctx, share.UserID, models.AuditActionShareAccess, "share", share.ID, true, fmt.Sprintf("Share accessed from IP: %s", ip))
+
 	return share, nil
+}
+
+// Helper function to extract domain from referrer or user agent
+func (s *SharingService) extractDomainFromRequest(userAgent, referrer string) string {
+	// Check referrer first
+	if referrer != "" {
+		// Parse the referrer URL to extract domain
+		if strings.HasPrefix(referrer, "http://") || strings.HasPrefix(referrer, "https://") {
+			parts := strings.Split(referrer, "/")
+			if len(parts) >= 3 {
+				domain := parts[2]
+				// Remove port if present
+				if colonIndex := strings.Index(domain, ":"); colonIndex != -1 {
+					domain = domain[:colonIndex]
+				}
+				return domain
+			}
+		}
+	}
+
+	// Fallback to extracting domain hints from user agent
+	// This is less reliable but can be useful for mobile apps
+	userAgentLower := strings.ToLower(userAgent)
+
+	// Common patterns in user agents that might indicate domain/app
+	if strings.Contains(userAgentLower, "example.com") {
+		return "example.com"
+	}
+
+	// Add more domain extraction logic as needed
+	return ""
+}
+
+// Enhanced tracking method for share access
+func (s *SharingService) trackShareAccess(ctx context.Context, share *models.Share, ip, userAgent, action string) {
+	metadata := map[string]interface{}{
+		"ip":         ip,
+		"user_agent": userAgent,
+		"action":     action,
+		"share_type": share.ShareType,
+		"permission": share.Permission,
+	}
+
+	analytics := &models.Analytics{
+		UserID:    nil, // Anonymous access
+		EventType: models.EventTypeShareAccess,
+		Action:    action,
+		Resource: models.AnalyticsResource{
+			Type: "share",
+			ID:   share.ID,
+			Name: share.CustomMessage, // Use custom message as name for shares
+		},
+		Metadata:  metadata,
+		IP:        ip,
+		UserAgent: userAgent,
+		Timestamp: time.Now(),
+	}
+
+	s.analyticsRepo.Create(ctx, analytics)
 }
 
 // DownloadSharedResource downloads a shared resource
