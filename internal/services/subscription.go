@@ -22,6 +22,7 @@ type SubscriptionService struct {
 	analyticsRepo    repository.AnalyticsRepository
 	paymentService   *PaymentService
 	emailService     EmailService
+	logger           *pkg.Logger
 }
 
 // NewSubscriptionService creates a new subscription service
@@ -33,6 +34,7 @@ func NewSubscriptionService(
 	analyticsRepo repository.AnalyticsRepository,
 	paymentService *PaymentService,
 	emailService EmailService,
+	logger *pkg.Logger,
 ) *SubscriptionService {
 	return &SubscriptionService{
 		subscriptionRepo: subscriptionRepo,
@@ -42,8 +44,13 @@ func NewSubscriptionService(
 		analyticsRepo:    analyticsRepo,
 		paymentService:   paymentService,
 		emailService:     emailService,
+		logger:           logger,
 	}
 }
+
+// ============================================================================
+// REQUEST/RESPONSE STRUCTURES
+// ============================================================================
 
 // CreateSubscriptionRequest represents subscription creation request
 type CreateSubscriptionRequest struct {
@@ -55,6 +62,26 @@ type CreateSubscriptionRequest struct {
 	BillingAddress *models.BillingAddress `json:"billingAddress,omitempty"`
 }
 
+// UpgradeDowngradeRequest represents plan change request
+type UpgradeDowngradeRequest struct {
+	NewPlanID         primitive.ObjectID `json:"newPlanId" validate:"required"`
+	EffectiveAt       string             `json:"effectiveAt,omitempty"`       // "immediate" or "end_of_period"
+	ProrationBehavior string             `json:"prorationBehavior,omitempty"` // "create_prorations" or "none"
+}
+
+// CancelSubscriptionRequest represents cancellation request
+type CancelSubscriptionRequest struct {
+	Reason      string `json:"reason,omitempty"`
+	CancelAtEnd bool   `json:"cancelAtEnd"` // true: cancel at period end, false: immediate
+	Feedback    string `json:"feedback,omitempty"`
+}
+
+// ReactivateSubscriptionRequest represents reactivation request
+type ReactivateSubscriptionRequest struct {
+	PaymentMethod  string `json:"paymentMethod,omitempty"`
+	PaymentTokenID string `json:"paymentTokenId,omitempty"`
+}
+
 // SubscriptionResponse represents subscription response
 type SubscriptionResponse struct {
 	*models.Subscription
@@ -64,28 +91,38 @@ type SubscriptionResponse struct {
 
 // SubscriptionUsage represents current usage statistics
 type SubscriptionUsage struct {
-	StorageUsed     int64   `json:"storageUsed"`
-	StorageLimit    int64   `json:"storageLimit"`
-	BandwidthUsed   int64   `json:"bandwidthUsed"`
-	BandwidthLimit  int64   `json:"bandwidthLimit"`
-	FilesCount      int64   `json:"filesCount"`
-	FilesLimit      int64   `json:"filesLimit"`
-	UsagePercentage float64 `json:"usagePercentage"`
+	StorageUsed      int64   `json:"storageUsed"`
+	StorageLimit     int64   `json:"storageLimit"`
+	StoragePercent   float64 `json:"storagePercent"`
+	BandwidthUsed    int64   `json:"bandwidthUsed"`
+	BandwidthLimit   int64   `json:"bandwidthLimit"`
+	BandwidthPercent float64 `json:"bandwidthPercent"`
+	FilesUsed        int64   `json:"filesUsed"`
+	FileLimit        int64   `json:"fileLimit"`
+	FilesPercent     float64 `json:"filesPercent"`
+	SharesUsed       int64   `json:"sharesUsed"`
+	ShareLimit       int64   `json:"shareLimit"`
+	SharesPercent    float64 `json:"sharesPercent"`
 }
 
-// UpgradeDowngradeRequest represents plan change request
-type UpgradeDowngradeRequest struct {
-	NewPlanID     primitive.ObjectID `json:"newPlanId" validate:"required"`
-	EffectiveAt   *time.Time         `json:"effectiveAt,omitempty"`   // nil = immediate
-	ProrationMode string             `json:"prorationMode,omitempty"` // "create_prorations", "none"
-}
+// ============================================================================
+// CORE SUBSCRIPTION METHODS
+// ============================================================================
 
-// Subscribe creates a new subscription
-func (s *SubscriptionService) Subscribe(ctx context.Context, userID primitive.ObjectID, req *CreateSubscriptionRequest) (*SubscriptionResponse, error) {
+// CreateSubscription creates a new subscription for a user
+func (s *SubscriptionService) CreateSubscription(ctx context.Context, userID primitive.ObjectID, req *CreateSubscriptionRequest) (*SubscriptionResponse, error) {
 	// Validate request
-	if err := pkg.DefaultValidator.Validate(req); err != nil {
+	if err := pkg.ValidateStruct(req); err != nil {
 		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
 			"errors": err,
+		})
+	}
+
+	// Check if user already has an active subscription
+	existingSubscription, err := s.subscriptionRepo.GetByUserID(ctx, userID)
+	if err == nil && existingSubscription.Status == models.SubscriptionStatusActive {
+		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
+			"message": "User already has an active subscription",
 		})
 	}
 
@@ -95,39 +132,19 @@ func (s *SubscriptionService) Subscribe(ctx context.Context, userID primitive.Ob
 		return nil, err
 	}
 
-	// Check if user already has active subscription
-	if existingSub, err := s.subscriptionRepo.GetByUserID(ctx, userID); err == nil {
-		if existingSub.Status == models.SubscriptionStatusActive || existingSub.Status == models.SubscriptionStatusTrialing {
-			return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
-				"message": "User already has an active subscription",
-			})
-		}
-	}
-
-	// Get subscription plan
+	// Get plan
 	plan, err := s.subscriptionRepo.GetPlanByID(ctx, req.PlanID)
 	if err != nil {
 		return nil, err
 	}
 
 	if !plan.IsActive {
-		return nil, pkg.ErrInvalidPlan
-	}
-
-	// Validate billing cycle is supported by plan
-	if !s.isPlanBillingCycleSupported(plan, req.BillingCycle) {
-		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
-			"message": fmt.Sprintf("Billing cycle %s is not supported for this plan", req.BillingCycle),
+		return nil, pkg.ErrInvalidPlan.WithDetails(map[string]interface{}{
+			"message": "Selected plan is not available",
 		})
 	}
 
-	// Calculate pricing with discounts/coupons
-	finalAmount, discountAmount, err := s.calculateSubscriptionPricing(ctx, plan, req.BillingCycle, req.CouponCode)
-	if err != nil {
-		return nil, err
-	}
-
-	// Calculate subscription period
+	// Calculate amounts
 	now := time.Now()
 	var periodEnd time.Time
 	switch req.BillingCycle {
@@ -139,6 +156,22 @@ func (s *SubscriptionService) Subscribe(ctx context.Context, userID primitive.Ob
 		periodEnd = now.AddDate(0, 0, 7)
 	default:
 		return nil, pkg.ErrInvalidInput
+	}
+
+	// Apply coupon if provided
+	finalAmount := plan.Price
+	discountAmount := int64(0)
+	if req.CouponCode != "" {
+		discount, err := s.applyCoupon(ctx, req.CouponCode, plan.Price)
+		if err == nil {
+			discountAmount = discount
+			finalAmount = plan.Price - discount
+		}
+	}
+
+	// Add setup fee if applicable
+	if plan.SetupFee > 0 {
+		finalAmount += plan.SetupFee
 	}
 
 	// Create subscription
@@ -176,24 +209,28 @@ func (s *SubscriptionService) Subscribe(ctx context.Context, userID primitive.Ob
 		subscription.Metadata["billing_address"] = *req.BillingAddress
 	}
 
-	// Create subscription with payment provider
-	switch req.PaymentMethod {
-	case "stripe":
-		if err := s.createStripeSubscription(ctx, subscription, plan, user, req); err != nil {
-			return nil, err
+	// Create subscription with payment provider (only if not in trial)
+	if subscription.Status != models.SubscriptionStatusTrialing {
+		switch req.PaymentMethod {
+		case "stripe":
+			if err := s.createStripeSubscription(ctx, subscription, plan, user, req); err != nil {
+				return nil, err
+			}
+		case "paypal":
+			if err := s.createPayPalSubscription(ctx, subscription, plan, user, req); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, pkg.ErrInvalidPaymentMethod
 		}
-	case "paypal":
-		if err := s.createPayPalSubscription(ctx, subscription, plan, user, req); err != nil {
-			return nil, err
-		}
-	default:
-		return nil, pkg.ErrInvalidPaymentMethod
 	}
 
 	// Save subscription
 	if err := s.subscriptionRepo.Create(ctx, subscription); err != nil {
 		// Rollback payment provider subscription if database save fails
-		s.rollbackPaymentProviderSubscription(ctx, subscription, req.PaymentMethod)
+		if subscription.Status != models.SubscriptionStatusTrialing {
+			s.rollbackPaymentProviderSubscription(ctx, subscription, req.PaymentMethod)
+		}
 		return nil, err
 	}
 
@@ -234,6 +271,9 @@ func (s *SubscriptionService) Subscribe(ctx context.Context, userID primitive.Ob
 func (s *SubscriptionService) GetUserSubscription(ctx context.Context, userID primitive.ObjectID) (*SubscriptionResponse, error) {
 	subscription, err := s.subscriptionRepo.GetByUserID(ctx, userID)
 	if err != nil {
+		if err.Error() == "subscription not found" {
+			return nil, pkg.ErrSubscriptionNotFound
+		}
 		return nil, err
 	}
 
@@ -253,10 +293,33 @@ func (s *SubscriptionService) GetUserSubscription(ctx context.Context, userID pr
 	}, nil
 }
 
+// GetSubscriptionByID retrieves subscription by ID (admin only)
+func (s *SubscriptionService) GetSubscriptionByID(ctx context.Context, subscriptionID primitive.ObjectID) (*SubscriptionResponse, error) {
+	subscription, err := s.subscriptionRepo.GetByID(ctx, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get plan details
+	plan, err := s.subscriptionRepo.GetPlanByID(ctx, subscription.PlanID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get usage statistics
+	usage, _ := s.getSubscriptionUsage(ctx, subscription.UserID, plan)
+
+	return &SubscriptionResponse{
+		Subscription: subscription,
+		Plan:         plan,
+		Usage:        usage,
+	}, nil
+}
+
 // UpgradeDowngradeSubscription changes the subscription plan
 func (s *SubscriptionService) UpgradeDowngradeSubscription(ctx context.Context, userID primitive.ObjectID, req *UpgradeDowngradeRequest) (*SubscriptionResponse, error) {
 	// Validate request
-	if err := pkg.DefaultValidator.Validate(req); err != nil {
+	if err := pkg.ValidateStruct(req); err != nil {
 		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
 			"errors": err,
 		})
@@ -286,178 +349,188 @@ func (s *SubscriptionService) UpgradeDowngradeSubscription(ctx context.Context, 
 	}
 
 	if !newPlan.IsActive {
-		return nil, pkg.ErrInvalidPlan
-	}
-
-	if currentPlan.ID == newPlan.ID {
-		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
-			"message": "Cannot change to the same plan",
+		return nil, pkg.ErrInvalidPlan.WithDetails(map[string]interface{}{
+			"message": "Target plan is not available",
 		})
 	}
 
-	// Calculate prorations if applicable
-	var prorationAmount int64
-	if req.ProrationMode == "create_prorations" {
+	// Check if it's actually a change
+	if subscription.PlanID == req.NewPlanID {
+		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
+			"message": "User is already on the selected plan",
+		})
+	}
+
+	// Get user
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Handle effective timing
+	if req.EffectiveAt == "end_of_period" {
+		// Schedule the change for end of current period
+		subscription.Metadata["scheduled_plan_change"] = map[string]interface{}{
+			"new_plan_id":  req.NewPlanID,
+			"effective_at": subscription.CurrentPeriodEnd,
+			"old_plan_id":  subscription.PlanID,
+			"scheduled_at": time.Now(),
+		}
+
+		updates := map[string]interface{}{
+			"metadata": subscription.Metadata,
+		}
+
+		if err := s.subscriptionRepo.Update(ctx, subscription.ID, updates); err != nil {
+			return nil, err
+		}
+
+		// Send scheduled change email
+		s.sendPlanChangeScheduledEmail(ctx, user, subscription, currentPlan, newPlan)
+
+		// Log audit event
+		s.logAuditEvent(ctx, userID, models.AuditActionSubscriptionUpdate, "subscription", subscription.ID, true, "Plan change scheduled")
+
+		return s.GetUserSubscription(ctx, userID)
+	}
+
+	// Immediate change - calculate proration if enabled
+	var prorationAmount int64 = 0
+	if req.ProrationBehavior == "create_prorations" {
 		prorationAmount = s.calculateProration(subscription, currentPlan, newPlan)
 	}
 
-	// Update subscription with payment provider
-	if subscription.StripeSubscriptionID != "" {
-		if err := s.updateStripeSubscription(ctx, subscription, newPlan, req); err != nil {
-			return nil, err
-		}
-	} else if subscription.PayPalSubscriptionID != "" {
-		if err := s.updatePayPalSubscription(ctx, subscription, newPlan, req); err != nil {
-			return nil, err
-		}
-	}
-
-	// Update subscription in database
+	// Update subscription with new plan
 	updates := map[string]interface{}{
 		"plan_id":  req.NewPlanID,
 		"amount":   newPlan.Price,
 		"currency": newPlan.Currency,
 	}
 
-	// Handle immediate vs scheduled changes
-	if req.EffectiveAt == nil || req.EffectiveAt.Before(time.Now()) {
-		// Immediate change
-		if err := s.subscriptionRepo.Update(ctx, subscription.ID, updates); err != nil {
-			return nil, err
-		}
-
-		// Update user storage limit
-		userUpdates := map[string]interface{}{
-			"storage_limit": newPlan.StorageLimit,
-		}
-		s.userRepo.Update(ctx, subscription.UserID, userUpdates)
-	} else {
-		// Scheduled change - store in metadata
-		subscription.Metadata["scheduled_plan_change"] = map[string]interface{}{
-			"new_plan_id":      req.NewPlanID,
-			"effective_at":     req.EffectiveAt,
-			"proration_amount": prorationAmount,
-		}
-		updates["metadata"] = subscription.Metadata
-		s.subscriptionRepo.Update(ctx, subscription.ID, updates)
+	if err := s.subscriptionRepo.Update(ctx, subscription.ID, updates); err != nil {
+		return nil, err
 	}
 
-	// Create proration payment if needed
+	// Update user storage limit
+	userUpdates := map[string]interface{}{
+		"storage_limit": newPlan.StorageLimit,
+		"subscription": models.UserSubscription{
+			PlanID:    newPlan.ID,
+			Status:    string(subscription.Status),
+			ExpiresAt: subscription.CurrentPeriodEnd,
+		},
+	}
+	if err := s.userRepo.Update(ctx, userID, userUpdates); err != nil {
+		s.logError(ctx, userID, "Failed to update user limits after plan change", err)
+	}
+
+	// Handle proration payment
 	if prorationAmount != 0 {
 		s.createProrationPayment(ctx, subscription, prorationAmount, currentPlan, newPlan)
 	}
 
-	// Send notification email
-	user, _ := s.userRepo.GetByID(ctx, subscription.UserID)
-	if user != nil {
-		s.sendPlanChangeNotificationEmail(ctx, user, currentPlan, newPlan, req.EffectiveAt)
-	}
+	// Update payment provider subscription
+	s.updatePaymentProviderSubscription(ctx, subscription, newPlan)
+
+	// Send plan change confirmation email
+	s.sendPlanChangeConfirmationEmail(ctx, user, subscription, currentPlan, newPlan)
 
 	// Log audit event
-	action := "upgrade"
+	action := "Plan upgraded"
 	if newPlan.Price < currentPlan.Price {
-		action = "downgrade"
+		action = "Plan downgraded"
 	}
-	s.logAuditEvent(ctx, userID, models.AuditActionSubscriptionUpdate, "subscription", subscription.ID, true,
-		fmt.Sprintf("Plan changed from %s to %s", currentPlan.Name, newPlan.Name))
+	s.logAuditEvent(ctx, userID, models.AuditActionSubscriptionUpdate, "subscription", subscription.ID, true, action)
 
 	// Track analytics
-	s.trackAnalytics(ctx, userID, models.EventTypeSubscription, action, subscription.ID,
-		fmt.Sprintf("%s -> %s", currentPlan.Name, newPlan.Name))
+	s.trackAnalytics(ctx, userID, models.EventTypeSubscription, "plan_change", subscription.ID, newPlan.Name)
 
-	// Return updated subscription
 	return s.GetUserSubscription(ctx, userID)
 }
 
-// UpdateSubscription updates subscription settings
-func (s *SubscriptionService) UpdateSubscription(ctx context.Context, userID primitive.ObjectID, updates map[string]interface{}) (*SubscriptionResponse, error) {
+// CancelSubscription cancels a user's subscription
+func (s *SubscriptionService) CancelSubscription(ctx context.Context, userID primitive.ObjectID, req *CancelSubscriptionRequest) (*SubscriptionResponse, error) {
 	// Get current subscription
 	subscription, err := s.subscriptionRepo.GetByUserID(ctx, userID)
 	if err != nil {
 		return nil, err
-	}
-
-	// Validate allowed updates
-	allowedUpdates := map[string]interface{}{}
-	for key, value := range updates {
-		switch key {
-		case "auto_renew", "cancel_reason", "metadata":
-			allowedUpdates[key] = value
-		default:
-			return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
-				"message": fmt.Sprintf("Field '%s' cannot be updated directly", key),
-			})
-		}
-	}
-
-	// Update subscription
-	if err := s.subscriptionRepo.Update(ctx, subscription.ID, allowedUpdates); err != nil {
-		return nil, err
-	}
-
-	// Log audit event
-	s.logAuditEvent(ctx, userID, models.AuditActionSubscriptionUpdate, "subscription", subscription.ID, true, "")
-
-	// Get updated subscription
-	return s.GetUserSubscription(ctx, userID)
-}
-
-// CancelSubscription cancels user's subscription
-func (s *SubscriptionService) CancelSubscription(ctx context.Context, userID primitive.ObjectID, cancelAtPeriodEnd bool, reason string) error {
-	// Get current subscription
-	subscription, err := s.subscriptionRepo.GetByUserID(ctx, userID)
-	if err != nil {
-		return err
 	}
 
 	if subscription.Status == models.SubscriptionStatusCanceled {
-		return pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
+		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
 			"message": "Subscription is already canceled",
 		})
 	}
 
-	// Cancel with payment provider
-	if subscription.StripeSubscriptionID != "" {
-		if err := s.cancelStripeSubscription(ctx, subscription, cancelAtPeriodEnd); err != nil {
-			return err
-		}
-	} else if subscription.PayPalSubscriptionID != "" {
-		if err := s.cancelPayPalSubscription(ctx, subscription); err != nil {
-			return err
-		}
+	// Get user and plan
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	plan, err := s.subscriptionRepo.GetPlanByID(ctx, subscription.PlanID)
+	if err != nil {
+		return nil, err
 	}
 
 	// Update subscription
 	updates := map[string]interface{}{
-		"cancel_at_period_end": cancelAtPeriodEnd,
-		"canceled_at":          time.Now(),
-		"cancel_reason":        reason,
+		"auto_renew": false,
 	}
 
-	if !cancelAtPeriodEnd {
+	if req.CancelAtEnd {
+		// Cancel at period end
+		updates["cancel_at_period_end"] = true
+		if req.Reason != "" {
+			updates["cancellation_reason"] = req.Reason
+		}
+	} else {
+		// Immediate cancellation
 		updates["status"] = models.SubscriptionStatusCanceled
-		// Revert to free plan storage limit
-		s.revertToFreePlan(ctx, userID)
+		updates["canceled_at"] = time.Now()
+		updates["cancellation_reason"] = req.Reason
+	}
+
+	// Store feedback if provided
+	if req.Feedback != "" {
+		if subscription.Metadata == nil {
+			subscription.Metadata = make(map[string]interface{})
+		}
+		subscription.Metadata["cancellation_feedback"] = req.Feedback
+		updates["metadata"] = subscription.Metadata
 	}
 
 	if err := s.subscriptionRepo.Update(ctx, subscription.ID, updates); err != nil {
-		return err
+		return nil, err
 	}
 
-	// Get user for email
-	user, err := s.userRepo.GetByID(ctx, userID)
-	if err == nil {
-		s.sendCancellationEmail(ctx, user, subscription, cancelAtPeriodEnd)
+	// Cancel with payment provider
+	s.cancelPaymentProviderSubscription(ctx, subscription)
+
+	// If immediate cancellation, revert to free plan
+	if !req.CancelAtEnd {
+		s.revertToFreePlan(ctx, userID)
 	}
+
+	// Send cancellation email
+	s.sendCancellationEmail(ctx, user, subscription, plan, req.CancelAtEnd)
 
 	// Log audit event
+	reason := "User cancellation"
+	if req.Reason != "" {
+		reason = req.Reason
+	}
 	s.logAuditEvent(ctx, userID, models.AuditActionSubscriptionCancel, "subscription", subscription.ID, true, reason)
 
-	return nil
+	// Track analytics
+	s.trackAnalytics(ctx, userID, models.EventTypeSubscription, "cancel", subscription.ID, plan.Name)
+
+	return s.GetUserSubscription(ctx, userID)
 }
 
 // ReactivateSubscription reactivates a canceled subscription
-func (s *SubscriptionService) ReactivateSubscription(ctx context.Context, userID primitive.ObjectID) (*SubscriptionResponse, error) {
+func (s *SubscriptionService) ReactivateSubscription(ctx context.Context, userID primitive.ObjectID, req *ReactivateSubscriptionRequest) (*SubscriptionResponse, error) {
+	// Get current subscription
 	subscription, err := s.subscriptionRepo.GetByUserID(ctx, userID)
 	if err != nil {
 		return nil, err
@@ -469,56 +542,327 @@ func (s *SubscriptionService) ReactivateSubscription(ctx context.Context, userID
 		})
 	}
 
-	// Check if still within the current period
-	if time.Now().After(subscription.CurrentPeriodEnd) {
-		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
-			"message": "Subscription period has expired, please create a new subscription",
-		})
+	// Get user and plan
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
 	}
 
-	// Reactivate with payment provider
-	if subscription.StripeSubscriptionID != "" {
-		if err := s.reactivateStripeSubscription(ctx, subscription); err != nil {
-			return nil, err
-		}
-	} else if subscription.PayPalSubscriptionID != "" {
-		if err := s.reactivatePayPalSubscription(ctx, subscription); err != nil {
-			return nil, err
-		}
+	plan, err := s.subscriptionRepo.GetPlanByID(ctx, subscription.PlanID)
+	if err != nil {
+		return nil, err
 	}
 
-	// Update subscription status
+	// Calculate new period
+	now := time.Now()
+	var nextPeriodEnd time.Time
+	switch subscription.BillingCycle {
+	case models.BillingCycleMonthly:
+		nextPeriodEnd = now.AddDate(0, 1, 0)
+	case models.BillingCycleYearly:
+		nextPeriodEnd = now.AddDate(1, 0, 0)
+	case models.BillingCycleWeekly:
+		nextPeriodEnd = now.AddDate(0, 0, 7)
+	default:
+		nextPeriodEnd = now.AddDate(0, 1, 0)
+	}
+
+	// Update subscription
 	updates := map[string]interface{}{
 		"status":               models.SubscriptionStatusActive,
+		"auto_renew":           true,
 		"cancel_at_period_end": false,
-		"canceled_at":          nil,
-		"cancel_reason":        "",
+		"current_period_start": now,
+		"current_period_end":   nextPeriodEnd,
+		"reactivated_at":       now,
 	}
+
+	// Remove cancellation fields
+	updates["canceled_at"] = nil
+	updates["cancellation_reason"] = ""
 
 	if err := s.subscriptionRepo.Update(ctx, subscription.ID, updates); err != nil {
 		return nil, err
 	}
 
-	// Restore user limits
-	plan, _ := s.subscriptionRepo.GetPlanByID(ctx, subscription.PlanID)
-	if plan != nil {
-		userUpdates := map[string]interface{}{
-			"storage_limit": plan.StorageLimit,
-		}
-		s.userRepo.Update(ctx, userID, userUpdates)
+	// Reactivate with payment provider if payment method provided
+	if req.PaymentMethod != "" {
+		s.reactivatePaymentProviderSubscription(ctx, subscription, req)
 	}
 
-	// Send reactivation email
-	user, _ := s.userRepo.GetByID(ctx, userID)
-	if user != nil && plan != nil {
-		s.sendReactivationEmail(ctx, user, subscription, plan)
+	// Restore user limits
+	userUpdates := map[string]interface{}{
+		"storage_limit": plan.StorageLimit,
+		"subscription": models.UserSubscription{
+			PlanID:    plan.ID,
+			Status:    string(models.SubscriptionStatusActive),
+			ExpiresAt: nextPeriodEnd,
+		},
 	}
+	s.userRepo.Update(ctx, userID, userUpdates)
+
+	// Send reactivation email
+	s.sendReactivationEmail(ctx, user, subscription, plan)
 
 	// Log audit event
 	s.logAuditEvent(ctx, userID, models.AuditActionSubscriptionUpdate, "subscription", subscription.ID, true, "Subscription reactivated")
 
+	// Track analytics
+	s.trackAnalytics(ctx, userID, models.EventTypeSubscription, "reactivate", subscription.ID, plan.Name)
+
 	return s.GetUserSubscription(ctx, userID)
 }
+
+// SuspendSubscription suspends a subscription (admin only)
+func (s *SubscriptionService) SuspendSubscription(ctx context.Context, userID primitive.ObjectID, reason string) error {
+	subscription, err := s.subscriptionRepo.GetByUserID(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	if subscription.Status == models.SubscriptionStatusCanceled {
+		return pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
+			"message": "Cannot suspend canceled subscription",
+		})
+	}
+
+	updates := map[string]interface{}{
+		"status":            models.SubscriptionStatusUnpaid,
+		"suspension_reason": reason,
+		"suspended_at":      time.Now(),
+	}
+
+	if err := s.subscriptionRepo.Update(ctx, subscription.ID, updates); err != nil {
+		return err
+	}
+
+	// Suspend with payment provider
+	s.suspendPaymentProviderSubscription(ctx, subscription)
+
+	// Revert to free plan temporarily
+	s.revertToFreePlan(ctx, userID)
+
+	// Log audit event
+	s.logAuditEvent(ctx, userID, models.AuditActionSubscriptionSuspend, "subscription", subscription.ID, true, reason)
+
+	return nil
+}
+
+// ============================================================================
+// PLAN MANAGEMENT METHODS
+// ============================================================================
+
+// GetAvailablePlans retrieves available subscription plans
+func (s *SubscriptionService) GetAvailablePlans(ctx context.Context) ([]*models.SubscriptionPlan, error) {
+	return s.subscriptionRepo.GetActivePlans(ctx)
+}
+
+// GetPlanByID retrieves a specific plan by ID
+func (s *SubscriptionService) GetPlanByID(ctx context.Context, planID primitive.ObjectID) (*models.SubscriptionPlan, error) {
+	return s.subscriptionRepo.GetPlanByID(ctx, planID)
+}
+
+// CreatePlan creates a new subscription plan (admin only)
+func (s *SubscriptionService) CreatePlan(ctx context.Context, plan *models.SubscriptionPlan) (*models.SubscriptionPlan, error) {
+	// Validate plan data
+	if plan.Price < 0 {
+		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
+			"message": "Plan price cannot be negative",
+		})
+	}
+
+	if plan.StorageLimit <= 0 {
+		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
+			"message": "Storage limit must be positive",
+		})
+	}
+
+	// Set defaults
+	if plan.Currency == "" {
+		plan.Currency = "USD"
+	}
+
+	// Set timestamps
+	now := time.Now()
+	plan.CreatedAt = now
+	plan.UpdatedAt = now
+
+	if err := s.subscriptionRepo.CreatePlan(ctx, plan); err != nil {
+		return nil, err
+	}
+
+	return plan, nil
+}
+
+// UpdatePlan updates subscription plan (admin only)
+func (s *SubscriptionService) UpdatePlan(ctx context.Context, planID primitive.ObjectID, updates map[string]interface{}) (*models.SubscriptionPlan, error) {
+	// Add updated timestamp
+	updates["updated_at"] = time.Now()
+
+	if err := s.subscriptionRepo.UpdatePlan(ctx, planID, updates); err != nil {
+		return nil, err
+	}
+
+	return s.subscriptionRepo.GetPlanByID(ctx, planID)
+}
+
+// DeletePlan deletes a subscription plan (admin only)
+func (s *SubscriptionService) DeletePlan(ctx context.Context, planID primitive.ObjectID) error {
+	// Check if plan has active subscriptions
+	subscriptions, err := s.subscriptionRepo.GetActiveSubscriptions(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, sub := range subscriptions {
+		if sub.PlanID == planID {
+			return pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
+				"message": "Cannot delete plan with active subscriptions",
+			})
+		}
+	}
+
+	return s.subscriptionRepo.DeletePlan(ctx, planID)
+}
+
+// ============================================================================
+// ADMIN AND ANALYTICS METHODS
+// ============================================================================
+
+// ListSubscriptions lists all subscriptions with optional filters (admin only)
+func (s *SubscriptionService) ListSubscriptions(ctx context.Context, params *pkg.PaginationParams, status string, userID *primitive.ObjectID) ([]*SubscriptionResponse, int64, error) {
+	// Apply filters
+	if status != "" {
+		if params.Filter == nil {
+			params.Filter = make(map[string]interface{})
+		}
+		params.Filter["status"] = status
+	}
+
+	if userID != nil {
+		if params.Filter == nil {
+			params.Filter = make(map[string]interface{})
+		}
+		params.Filter["user_id"] = *userID
+	}
+
+	subscriptions, total, err := s.subscriptionRepo.List(ctx, params)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Convert to response format
+	responses := make([]*SubscriptionResponse, len(subscriptions))
+	for i, sub := range subscriptions {
+		plan, _ := s.subscriptionRepo.GetPlanByID(ctx, sub.PlanID)
+		usage, _ := s.getSubscriptionUsage(ctx, sub.UserID, plan)
+
+		responses[i] = &SubscriptionResponse{
+			Subscription: sub,
+			Plan:         plan,
+			Usage:        usage,
+		}
+	}
+
+	return responses, total, nil
+}
+
+// GetSubscriptionStats returns subscription statistics
+func (s *SubscriptionService) GetSubscriptionStats(ctx context.Context) (map[string]interface{}, error) {
+	// Get total subscription count
+	_, totalCount, err := s.subscriptionRepo.List(ctx, &pkg.PaginationParams{Page: 1, Limit: 1})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get total subscriptions: %w", err)
+	}
+
+	activeSubscriptions, err := s.subscriptionRepo.GetActiveSubscriptions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get active subscriptions: %w", err)
+	}
+
+	trialingSubscriptions, err := s.subscriptionRepo.GetSubscriptionsByStatus(ctx, models.SubscriptionStatusTrialing)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get trialing subscriptions: %w", err)
+	}
+
+	canceledSubscriptions, err := s.subscriptionRepo.GetSubscriptionsByStatus(ctx, models.SubscriptionStatusCanceled)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get canceled subscriptions: %w", err)
+	}
+
+	// Calculate MRR (Monthly Recurring Revenue)
+	var mrr int64 = 0
+	var arr int64 = 0 // Annual Recurring Revenue
+
+	for _, sub := range activeSubscriptions {
+		switch sub.BillingCycle {
+		case models.BillingCycleMonthly:
+			mrr += sub.Amount
+			arr += sub.Amount * 12
+		case models.BillingCycleYearly:
+			mrr += sub.Amount / 12
+			arr += sub.Amount
+		case models.BillingCycleWeekly:
+			mrr += sub.Amount * 4 // Approximate monthly
+			arr += sub.Amount * 52
+		}
+	}
+
+	return map[string]interface{}{
+		"total_subscriptions":    totalCount,
+		"active_subscriptions":   len(activeSubscriptions),
+		"trialing_subscriptions": len(trialingSubscriptions),
+		"canceled_subscriptions": len(canceledSubscriptions),
+		"mrr":                    mrr,
+		"arr":                    arr,
+		"conversion_rate":        s.calculateConversionRate(len(trialingSubscriptions), len(activeSubscriptions)),
+		"churn_rate":             s.calculateChurnRate(len(activeSubscriptions), len(canceledSubscriptions)),
+	}, nil
+}
+
+// GetRevenueStats returns revenue statistics
+func (s *SubscriptionService) GetRevenueStats(ctx context.Context, period string, limit int) (map[string]interface{}, error) {
+	// This would integrate with your analytics repository
+	// For now, return basic structure
+	return map[string]interface{}{
+		"period": period,
+		"data":   []map[string]interface{}{},
+	}, nil
+}
+
+// ============================================================================
+// INVOICE AND BILLING METHODS
+// ============================================================================
+
+// GetUserInvoices retrieves invoices for a user
+func (s *SubscriptionService) GetUserInvoices(ctx context.Context, userID primitive.ObjectID, params *pkg.PaginationParams) ([]*models.Invoice, int64, error) {
+	// Apply user filter
+	if params.Filter == nil {
+		params.Filter = make(map[string]interface{})
+	}
+	params.Filter["user_id"] = userID
+
+	return s.paymentRepo.ListInvoices(ctx, params)
+}
+
+// GetUsageStatistics retrieves usage statistics for a user
+func (s *SubscriptionService) GetUsageStatistics(ctx context.Context, userID primitive.ObjectID) (*SubscriptionUsage, error) {
+	subscription, err := s.subscriptionRepo.GetByUserID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	plan, err := s.subscriptionRepo.GetPlanByID(ctx, subscription.PlanID)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.getSubscriptionUsage(ctx, userID, plan)
+}
+
+// ============================================================================
+// BACKGROUND PROCESSING METHODS
+// ============================================================================
 
 // ProcessSubscriptionRenewals processes subscription renewals
 func (s *SubscriptionService) ProcessSubscriptionRenewals(ctx context.Context) error {
@@ -576,200 +920,51 @@ func (s *SubscriptionService) ProcessScheduledPlanChanges(ctx context.Context) e
 	return nil
 }
 
-// GetAvailablePlans retrieves available subscription plans
-func (s *SubscriptionService) GetAvailablePlans(ctx context.Context) ([]*models.SubscriptionPlan, error) {
-	return s.subscriptionRepo.GetActivePlans(ctx)
-}
+// ============================================================================
+// UTILITY AND HELPER METHODS
+// ============================================================================
 
-// CreatePlan creates a new subscription plan (admin only)
-func (s *SubscriptionService) CreatePlan(ctx context.Context, plan *models.SubscriptionPlan) (*models.SubscriptionPlan, error) {
-	// Validate plan data
-	if plan.Price < 0 {
-		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
-			"message": "Plan price cannot be negative",
-		})
-	}
-
-	if plan.StorageLimit <= 0 {
-		return nil, pkg.ErrValidationFailed.WithDetails(map[string]interface{}{
-			"message": "Storage limit must be positive",
-		})
-	}
-
-	// Set defaults
-	if plan.Currency == "" {
-		plan.Currency = "USD"
-	}
-
-	if err := s.subscriptionRepo.CreatePlan(ctx, plan); err != nil {
-		return nil, err
-	}
-
-	return plan, nil
-}
-
-// UpdatePlan updates subscription plan (admin only)
-func (s *SubscriptionService) UpdatePlan(ctx context.Context, planID primitive.ObjectID, updates map[string]interface{}) (*models.SubscriptionPlan, error) {
-	if err := s.subscriptionRepo.UpdatePlan(ctx, planID, updates); err != nil {
-		return nil, err
-	}
-
-	return s.subscriptionRepo.GetPlanByID(ctx, planID)
-}
-
-// GetSubscriptionStats returns subscription statistics
-func (s *SubscriptionService) GetSubscriptionStats(ctx context.Context) (map[string]interface{}, error) {
-	// Get total subscription count using the count return value, not the slice length
-	_, totalCount, err := s.subscriptionRepo.List(ctx, &pkg.PaginationParams{Page: 1, Limit: 1})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get total subscriptions: %w", err)
-	}
-
-	activeSubscriptions, err := s.subscriptionRepo.GetActiveSubscriptions(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get active subscriptions: %w", err)
-	}
-
-	trialingSubscriptions, err := s.subscriptionRepo.GetSubscriptionsByStatus(ctx, models.SubscriptionStatusTrialing)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get trialing subscriptions: %w", err)
-	}
-
-	canceledSubscriptions, err := s.subscriptionRepo.GetSubscriptionsByStatus(ctx, models.SubscriptionStatusCanceled)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get canceled subscriptions: %w", err)
-	}
-
-	// Calculate conversion rate
-	var conversionRate float64
-	if totalCount > 0 {
-		conversionRate = float64(len(activeSubscriptions)) / float64(totalCount) * 100
-	}
-
-	// Calculate churn rate (simplified)
-	var churnRate float64
-	if len(activeSubscriptions)+len(canceledSubscriptions) > 0 {
-		churnRate = float64(len(canceledSubscriptions)) / float64(len(activeSubscriptions)+len(canceledSubscriptions)) * 100
-	}
-
-	return map[string]interface{}{
-		"total_subscriptions":    totalCount,
-		"active_subscriptions":   len(activeSubscriptions),
-		"trialing_subscriptions": len(trialingSubscriptions),
-		"canceled_subscriptions": len(canceledSubscriptions),
-		"conversion_rate":        conversionRate,
-		"churn_rate":             churnRate,
-	}, nil
-}
-
-// GetSubscriptionsByPlan returns subscription count by plan
-func (s *SubscriptionService) GetSubscriptionsByPlan(ctx context.Context) (map[string]interface{}, error) {
-	plans, err := s.subscriptionRepo.GetActivePlans(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	planStats := make(map[string]interface{})
-
-	for _, plan := range plans {
-		// Get subscriptions for this plan
-		params := &pkg.PaginationParams{
-			Page:  1,
-			Limit: 1,
-			Filter: map[string]interface{}{
-				"plan_id": plan.ID,
-				"status":  models.SubscriptionStatusActive,
-			},
-		}
-		_, count, err := s.subscriptionRepo.List(ctx, params)
-		if err != nil {
-			continue
-		}
-
-		planStats[plan.Name] = map[string]interface{}{
-			"plan_id":     plan.ID,
-			"subscribers": count,
-			"price":       plan.Price,
-			"currency":    plan.Currency,
-		}
-	}
-
-	return planStats, nil
-}
-
-// Helper Methods
-
-// isPlanBillingCycleSupported checks if billing cycle is supported by plan
-func (s *SubscriptionService) isPlanBillingCycleSupported(_ *models.SubscriptionPlan, cycle models.BillingCycle) bool {
-	// You can implement specific logic here based on plan features
-	// For now, assume all plans support monthly and yearly
-	return cycle == models.BillingCycleMonthly || cycle == models.BillingCycleYearly
-}
-
-// calculateSubscriptionPricing calculates final pricing with discounts
-func (s *SubscriptionService) calculateSubscriptionPricing(_ context.Context, plan *models.SubscriptionPlan, cycle models.BillingCycle, couponCode string) (int64, int64, error) {
-	baseAmount := plan.Price
-	discountAmount := int64(0)
-
-	// Apply yearly discount if applicable
-	if cycle == models.BillingCycleYearly {
-		// 10% discount for yearly billing
-		discountAmount = baseAmount / 10
-	}
-
-	// Apply coupon discount if provided
-	if couponCode != "" {
-		// This would integrate with your coupon system
-		// For now, apply a simple discount
-		switch couponCode {
-		case "SAVE20":
-			additionalDiscount := baseAmount / 5 // 20% discount
-			discountAmount += additionalDiscount
-		case "SAVE10":
-			additionalDiscount := baseAmount / 10 // 10% discount
-			discountAmount += additionalDiscount
-		case "FIRSTMONTH":
-			if cycle == models.BillingCycleMonthly {
-				discountAmount += baseAmount // First month free
-			}
-		}
-	}
-
-	finalAmount := baseAmount - discountAmount
-	if finalAmount < 0 {
-		finalAmount = 0
-	}
-
-	return finalAmount, discountAmount, nil
-}
-
-// getSubscriptionUsage calculates current usage statistics
+// getSubscriptionUsage calculates usage statistics
 func (s *SubscriptionService) getSubscriptionUsage(ctx context.Context, userID primitive.ObjectID, plan *models.SubscriptionPlan) (*SubscriptionUsage, error) {
+	// Get user storage usage
 	user, err := s.userRepo.GetByID(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Calculate usage percentage
-	var usagePercentage float64
+	// Calculate percentages
+	storagePercent := float64(0)
 	if plan.StorageLimit > 0 {
-		usagePercentage = float64(user.StorageUsed) / float64(plan.StorageLimit) * 100
+		storagePercent = float64(user.StorageUsed) / float64(plan.StorageLimit) * 100
 	}
 
+	// For now, return basic usage. In a real implementation, you'd fetch these from analytics
 	return &SubscriptionUsage{
-		StorageUsed:     user.StorageUsed,
-		StorageLimit:    plan.StorageLimit,
-		BandwidthUsed:   0, // Would be calculated from analytics
-		BandwidthLimit:  plan.BandwidthLimit,
-		FilesCount:      0, // Would be calculated from file count
-		FilesLimit:      plan.FileLimit,
-		UsagePercentage: usagePercentage,
+		StorageUsed:      user.StorageUsed,
+		StorageLimit:     plan.StorageLimit,
+		StoragePercent:   storagePercent,
+		BandwidthUsed:    0, // Would come from analytics
+		BandwidthLimit:   plan.BandwidthLimit,
+		BandwidthPercent: 0,
+		FilesUsed:        0, // Would come from file count
+		FileLimit:        plan.FileLimit,
+		FilesPercent:     0,
+		SharesUsed:       0, // Would come from share count
+		ShareLimit:       plan.ShareLimit,
+		SharesPercent:    0,
 	}, nil
 }
 
+// applyCoupon applies a coupon code and returns discount amount
+func (s *SubscriptionService) applyCoupon(ctx context.Context, couponCode string, amount int64) (int64, error) {
+	// Implement coupon logic here
+	// For now, return 0 (no discount)
+	return 0, nil
+}
+
 // calculateProration calculates proration amount for plan changes
-func (s *SubscriptionService) calculateProration(subscription *models.Subscription, _ *models.SubscriptionPlan, newPlan *models.SubscriptionPlan) int64 {
-	// Calculate remaining days in current period
+func (s *SubscriptionService) calculateProration(subscription *models.Subscription, oldPlan, newPlan *models.SubscriptionPlan) int64 {
+	// Calculate proration based on remaining days and price difference
 	now := time.Now()
 	totalDays := subscription.CurrentPeriodEnd.Sub(subscription.CurrentPeriodStart).Hours() / 24
 	remainingDays := subscription.CurrentPeriodEnd.Sub(now).Hours() / 24
@@ -778,122 +973,46 @@ func (s *SubscriptionService) calculateProration(subscription *models.Subscripti
 		return 0
 	}
 
-	// Calculate unused amount from old plan
-	unusedAmount := int64(float64(subscription.Amount) * (remainingDays / totalDays))
+	// Calculate daily rates
+	oldDailyRate := float64(oldPlan.Price) / totalDays
+	newDailyRate := float64(newPlan.Price) / totalDays
 
-	// Calculate new amount for remaining period
-	newAmount := int64(float64(newPlan.Price) * (remainingDays / totalDays))
+	// Calculate proration
+	proratedOldAmount := oldDailyRate * remainingDays
+	proratedNewAmount := newDailyRate * remainingDays
 
-	return newAmount - unusedAmount
+	return int64(proratedNewAmount - proratedOldAmount)
+}
+
+// calculateConversionRate calculates trial to paid conversion rate
+func (s *SubscriptionService) calculateConversionRate(trialCount, activeCount int) float64 {
+	if trialCount == 0 {
+		return 0
+	}
+	return float64(activeCount) / float64(trialCount+activeCount) * 100
+}
+
+// calculateChurnRate calculates subscription churn rate
+func (s *SubscriptionService) calculateChurnRate(activeCount, canceledCount int) float64 {
+	total := activeCount + canceledCount
+	if total == 0 {
+		return 0
+	}
+	return float64(canceledCount) / float64(total) * 100
 }
 
 // revertToFreePlan reverts user to free plan limits
 func (s *SubscriptionService) revertToFreePlan(ctx context.Context, userID primitive.ObjectID) {
-	updates := map[string]interface{}{
-		"storage_limit": 5 * 1024 * 1024 * 1024, // 5GB free limit
+	userUpdates := map[string]interface{}{
+		"storage_limit": int64(5 * 1024 * 1024 * 1024), // 5GB
 		"subscription":  nil,
 	}
-	s.userRepo.Update(ctx, userID, updates)
+	s.userRepo.Update(ctx, userID, userUpdates)
 }
 
-// Payment Provider Integration Methods
-
-// createStripeSubscription creates subscription with Stripe
-func (s *SubscriptionService) createStripeSubscription(_ context.Context, subscription *models.Subscription, _ *models.SubscriptionPlan, _ *models.User, req *CreateSubscriptionRequest) error {
-	// In a real implementation, this would integrate with Stripe API
-	// Create customer if doesn't exist
-	customerToken, err := pkg.GenerateRandomToken(14)
-	if err != nil {
-		return pkg.ErrInternalServer.WithCause(err)
-	}
-	customerID := fmt.Sprintf("cus_%s", customerToken)
-
-	// Create subscription
-	subscriptionToken, err := pkg.GenerateRandomToken(14)
-	if err != nil {
-		return pkg.ErrInternalServer.WithCause(err)
-	}
-	subscriptionID := fmt.Sprintf("sub_%s", subscriptionToken)
-
-	subscription.StripeCustomerID = customerID
-	subscription.StripeSubscriptionID = subscriptionID
-
-	// Store billing address if provided
-	if req.BillingAddress != nil {
-		subscription.Metadata["billing_address"] = *req.BillingAddress
-	}
-
-	return nil
-}
-
-// createPayPalSubscription creates subscription with PayPal
-func (s *SubscriptionService) createPayPalSubscription(_ context.Context, subscription *models.Subscription, _ *models.SubscriptionPlan, _ *models.User, _ *CreateSubscriptionRequest) error {
-	// In a real implementation, this would integrate with PayPal API
-	subscriptionToken, err := pkg.GenerateRandomToken(10)
-	if err != nil {
-		return pkg.ErrInternalServer.WithCause(err)
-	}
-	subscriptionID := fmt.Sprintf("I-%s", subscriptionToken)
-	subscription.PayPalSubscriptionID = subscriptionID
-
-	return nil
-}
-
-// updateStripeSubscription updates Stripe subscription
-func (s *SubscriptionService) updateStripeSubscription(_ context.Context, _ *models.Subscription, _ *models.SubscriptionPlan, _ *UpgradeDowngradeRequest) error {
-	// Stripe API integration would go here
-	return nil
-}
-
-// updatePayPalSubscription updates PayPal subscription
-func (s *SubscriptionService) updatePayPalSubscription(_ context.Context, _ *models.Subscription, _ *models.SubscriptionPlan, _ *UpgradeDowngradeRequest) error {
-	// PayPal API integration would go here
-	return nil
-}
-
-// cancelStripeSubscription cancels Stripe subscription
-func (s *SubscriptionService) cancelStripeSubscription(_ context.Context, _ *models.Subscription, _ bool) error {
-	// Stripe API call to cancel subscription
-	return nil
-}
-
-// cancelPayPalSubscription cancels PayPal subscription
-func (s *SubscriptionService) cancelPayPalSubscription(_ context.Context, _ *models.Subscription) error {
-	// PayPal API call to cancel subscription
-	return nil
-}
-
-// reactivateStripeSubscription reactivates Stripe subscription
-func (s *SubscriptionService) reactivateStripeSubscription(_ context.Context, _ *models.Subscription) error {
-	// Stripe API call to reactivate subscription
-	return nil
-}
-
-// reactivatePayPalSubscription reactivates PayPal subscription
-func (s *SubscriptionService) reactivatePayPalSubscription(_ context.Context, _ *models.Subscription) error {
-	// PayPal API call to reactivate subscription
-	return nil
-}
-
-// rollbackPaymentProviderSubscription rolls back payment provider subscription
-func (s *SubscriptionService) rollbackPaymentProviderSubscription(ctx context.Context, subscription *models.Subscription, paymentMethod string) {
-	switch paymentMethod {
-	case "stripe":
-		// Cancel Stripe subscription
-		if subscription.StripeSubscriptionID != "" {
-			s.cancelStripeSubscription(ctx, subscription, false)
-		}
-	case "paypal":
-		// Cancel PayPal subscription
-		if subscription.PayPalSubscriptionID != "" {
-			s.cancelPayPalSubscription(ctx, subscription)
-		}
-	}
-}
-
-// renewSubscription renews a subscription
+// renewSubscription handles subscription renewal
 func (s *SubscriptionService) renewSubscription(ctx context.Context, subscription *models.Subscription) error {
-	// Calculate next period
+	// Calculate next billing period
 	var nextPeriodEnd time.Time
 	switch subscription.BillingCycle {
 	case models.BillingCycleMonthly:
@@ -902,20 +1021,12 @@ func (s *SubscriptionService) renewSubscription(ctx context.Context, subscriptio
 		nextPeriodEnd = subscription.CurrentPeriodEnd.AddDate(1, 0, 0)
 	case models.BillingCycleWeekly:
 		nextPeriodEnd = subscription.CurrentPeriodEnd.AddDate(0, 0, 7)
+	default:
+		nextPeriodEnd = subscription.CurrentPeriodEnd.AddDate(0, 1, 0)
 	}
 
-	// Create payment for renewal
-	payment := &models.Payment{
-		UserID:         subscription.UserID,
-		SubscriptionID: &subscription.ID,
-		Amount:         subscription.Amount,
-		Currency:       subscription.Currency,
-		Status:         models.PaymentStatusSucceeded,
-		Type:           models.PaymentTypeSubscription,
-		Description:    "Subscription renewal",
-	}
-
-	if err := s.paymentRepo.Create(ctx, payment); err != nil {
+	// Process payment
+	if err := s.processRenewalPayment(ctx, subscription); err != nil {
 		return err
 	}
 
@@ -927,34 +1038,6 @@ func (s *SubscriptionService) renewSubscription(ctx context.Context, subscriptio
 	}
 
 	return s.subscriptionRepo.Update(ctx, subscription.ID, updates)
-}
-
-// createProrationPayment creates a proration payment
-func (s *SubscriptionService) createProrationPayment(ctx context.Context, subscription *models.Subscription, amount int64, oldPlan, newPlan *models.SubscriptionPlan) {
-	if amount == 0 {
-		return
-	}
-
-	paymentType := models.PaymentTypeOneTime
-	description := fmt.Sprintf("Proration for plan change from %s to %s", oldPlan.Name, newPlan.Name)
-
-	if amount < 0 {
-		paymentType = models.PaymentTypeRefund
-		description = fmt.Sprintf("Refund for plan downgrade from %s to %s", oldPlan.Name, newPlan.Name)
-		amount = -amount
-	}
-
-	payment := &models.Payment{
-		UserID:         subscription.UserID,
-		SubscriptionID: &subscription.ID,
-		Amount:         amount,
-		Currency:       subscription.Currency,
-		Status:         models.PaymentStatusSucceeded,
-		Type:           paymentType,
-		Description:    description,
-	}
-
-	s.paymentRepo.Create(ctx, payment)
 }
 
 // executeScheduledPlanChange executes a scheduled plan change
@@ -985,15 +1068,97 @@ func (s *SubscriptionService) executeScheduledPlanChange(ctx context.Context, su
 	return s.userRepo.Update(ctx, subscription.UserID, userUpdates)
 }
 
-// Email Notification Methods
+// createProrationPayment creates a proration payment
+func (s *SubscriptionService) createProrationPayment(ctx context.Context, subscription *models.Subscription, amount int64, oldPlan, newPlan *models.SubscriptionPlan) {
+	if amount == 0 {
+		return
+	}
+
+	paymentType := models.PaymentTypeOneTime
+	description := fmt.Sprintf("Proration for plan change from %s to %s", oldPlan.Name, newPlan.Name)
+
+	if amount < 0 {
+		paymentType = models.PaymentTypeRefund
+		description = fmt.Sprintf("Refund for plan downgrade from %s to %s", oldPlan.Name, newPlan.Name)
+		amount = -amount
+	}
+
+	payment := &models.Payment{
+		UserID:         subscription.UserID,
+		SubscriptionID: &subscription.ID,
+		Amount:         amount,
+		Currency:       subscription.Currency,
+		Status:         models.PaymentStatusSucceeded,
+		Type:           paymentType,
+		Description:    description,
+	}
+
+	s.paymentRepo.Create(ctx, payment)
+}
+
+// ============================================================================
+// PAYMENT PROVIDER INTEGRATION
+// ============================================================================
+
+// createStripeSubscription creates subscription with Stripe
+func (s *SubscriptionService) createStripeSubscription(ctx context.Context, subscription *models.Subscription, plan *models.SubscriptionPlan, user *models.User, req *CreateSubscriptionRequest) error {
+	// Implement Stripe subscription creation
+	// This is a placeholder implementation
+	subscription.Metadata["stripe_subscription_id"] = "sub_" + primitive.NewObjectID().Hex()
+	return nil
+}
+
+// createPayPalSubscription creates subscription with PayPal
+func (s *SubscriptionService) createPayPalSubscription(ctx context.Context, subscription *models.Subscription, plan *models.SubscriptionPlan, user *models.User, req *CreateSubscriptionRequest) error {
+	// Implement PayPal subscription creation
+	// This is a placeholder implementation
+	subscription.Metadata["paypal_subscription_id"] = "I-" + primitive.NewObjectID().Hex()
+	return nil
+}
+
+// updatePaymentProviderSubscription updates subscription with payment provider
+func (s *SubscriptionService) updatePaymentProviderSubscription(ctx context.Context, subscription *models.Subscription, plan *models.SubscriptionPlan) {
+	// Implement payment provider update logic
+}
+
+// cancelPaymentProviderSubscription cancels subscription with payment provider
+func (s *SubscriptionService) cancelPaymentProviderSubscription(ctx context.Context, subscription *models.Subscription) {
+	// Implement payment provider cancellation logic
+}
+
+// suspendPaymentProviderSubscription suspends subscription with payment provider
+func (s *SubscriptionService) suspendPaymentProviderSubscription(ctx context.Context, subscription *models.Subscription) {
+	// Implement payment provider suspension logic
+}
+
+// reactivatePaymentProviderSubscription reactivates subscription with payment provider
+func (s *SubscriptionService) reactivatePaymentProviderSubscription(ctx context.Context, subscription *models.Subscription, req *ReactivateSubscriptionRequest) {
+	// Implement payment provider reactivation logic
+}
+
+// rollbackPaymentProviderSubscription rolls back payment provider subscription
+func (s *SubscriptionService) rollbackPaymentProviderSubscription(ctx context.Context, subscription *models.Subscription, paymentMethod string) {
+	// Implement rollback logic
+}
+
+// processRenewalPayment processes renewal payment
+func (s *SubscriptionService) processRenewalPayment(ctx context.Context, subscription *models.Subscription) error {
+	// Implement renewal payment processing
+	return nil
+}
+
+// ============================================================================
+// EMAIL NOTIFICATION METHODS
+// ============================================================================
 
 // sendSubscriptionConfirmationEmail sends subscription confirmation
 func (s *SubscriptionService) sendSubscriptionConfirmationEmail(ctx context.Context, user *models.User, subscription *models.Subscription, plan *models.SubscriptionPlan) {
-	subject := "Subscription Confirmed"
+	subject := "Subscription Confirmed - Welcome to CloudDrive Premium!"
+
 	message := fmt.Sprintf(`
 Dear %s %s,
 
-Your subscription to %s has been confirmed!
+Your subscription to CloudDrive %s has been confirmed!
 
 Subscription Details:
 - Plan: %s
@@ -1005,67 +1170,32 @@ You now have access to:
 - %s storage
 - %s bandwidth per month
 - Up to %d files
+- Priority support
 
 Thank you for choosing CloudDrive!
 
 Best regards,
 The CloudDrive Team
-`, user.FirstName, user.LastName, plan.Name, plan.Name, strings.Title(string(subscription.BillingCycle)),
-		float64(subscription.Amount)/100, subscription.Currency, subscription.CurrentPeriodEnd.Format("2006-01-02"),
-		pkg.Files.FormatFileSize(plan.StorageLimit), pkg.Files.FormatFileSize(plan.BandwidthLimit), plan.FileLimit)
+`, user.FirstName, user.LastName, plan.Name, plan.Name,
+		strings.Title(string(subscription.BillingCycle)),
+		float64(subscription.Amount)/100, subscription.Currency,
+		subscription.CurrentPeriodEnd.Format("January 2, 2006"),
+		pkg.FormatFileSize(plan.StorageLimit),
+		pkg.FormatFileSize(plan.BandwidthLimit),
+		plan.FileLimit)
 
 	go s.emailService.SendNotificationEmail(ctx, user.Email, subject, message)
 }
 
-// sendCancellationEmail sends cancellation confirmation
-func (s *SubscriptionService) sendCancellationEmail(ctx context.Context, user *models.User, subscription *models.Subscription, cancelAtPeriodEnd bool) {
-	subject := "Subscription Canceled"
-	var message string
-
-	if cancelAtPeriodEnd {
-		message = fmt.Sprintf(`
-Dear %s %s,
-
-Your subscription has been scheduled for cancellation.
-
-Your subscription will remain active until %s, after which it will be canceled and you'll be moved to our free plan.
-
-You can reactivate your subscription at any time before the cancellation date.
-
-Best regards,
-The CloudDrive Team
-`, user.FirstName, user.LastName, subscription.CurrentPeriodEnd.Format("2006-01-02"))
-	} else {
-		message = fmt.Sprintf(`
-Dear %s %s,
-
-Your subscription has been canceled immediately.
-
-You have been moved to our free plan with limited storage and features.
-
-You can resubscribe at any time to regain access to premium features.
-
-Best regards,
-The CloudDrive Team
-`, user.FirstName, user.LastName)
-	}
-
-	go s.emailService.SendNotificationEmail(ctx, user.Email, subject, message)
-}
-
-// sendPlanChangeNotificationEmail sends plan change notification
-func (s *SubscriptionService) sendPlanChangeNotificationEmail(ctx context.Context, user *models.User, oldPlan, newPlan *models.SubscriptionPlan, effectiveAt *time.Time) {
-	subject := "Subscription Plan Updated"
+// sendPlanChangeConfirmationEmail sends plan change confirmation
+func (s *SubscriptionService) sendPlanChangeConfirmationEmail(ctx context.Context, user *models.User, subscription *models.Subscription, oldPlan, newPlan *models.SubscriptionPlan) {
 	effectiveText := "immediately"
-
-	if effectiveAt != nil && effectiveAt.After(time.Now()) {
-		effectiveText = fmt.Sprintf("on %s", effectiveAt.Format("2006-01-02"))
-	}
+	subject := "Subscription Plan Changed"
 
 	message := fmt.Sprintf(`
 Dear %s %s,
 
-Your subscription plan has been updated %s.
+Your subscription plan has been changed %s.
 
 Plan Change:
 - From: %s ($%.2f)
@@ -1079,15 +1209,65 @@ Your new plan includes:
 Best regards,
 The CloudDrive Team
 `, user.FirstName, user.LastName, effectiveText, oldPlan.Name, float64(oldPlan.Price)/100,
-		newPlan.Name, float64(newPlan.Price)/100, pkg.Files.FormatFileSize(newPlan.StorageLimit),
-		pkg.Files.FormatFileSize(newPlan.BandwidthLimit), newPlan.FileLimit)
+		newPlan.Name, float64(newPlan.Price)/100, pkg.FormatFileSize(newPlan.StorageLimit),
+		pkg.FormatFileSize(newPlan.BandwidthLimit), newPlan.FileLimit)
+
+	go s.emailService.SendNotificationEmail(ctx, user.Email, subject, message)
+}
+
+// sendPlanChangeScheduledEmail sends scheduled plan change notification
+func (s *SubscriptionService) sendPlanChangeScheduledEmail(ctx context.Context, user *models.User, subscription *models.Subscription, oldPlan, newPlan *models.SubscriptionPlan) {
+	subject := "Subscription Plan Change Scheduled"
+
+	message := fmt.Sprintf(`
+Dear %s %s,
+
+Your subscription plan change has been scheduled for %s.
+
+Plan Change:
+- From: %s ($%.2f)
+- To: %s ($%.2f)
+
+The change will take effect at the end of your current billing period.
+
+Best regards,
+The CloudDrive Team
+`, user.FirstName, user.LastName, subscription.CurrentPeriodEnd.Format("January 2, 2006"),
+		oldPlan.Name, float64(oldPlan.Price)/100,
+		newPlan.Name, float64(newPlan.Price)/100)
+
+	go s.emailService.SendNotificationEmail(ctx, user.Email, subject, message)
+}
+
+// sendCancellationEmail sends cancellation confirmation
+func (s *SubscriptionService) sendCancellationEmail(ctx context.Context, user *models.User, subscription *models.Subscription, plan *models.SubscriptionPlan, cancelAtEnd bool) {
+	subject := "Subscription Canceled"
+
+	effectiveText := "immediately"
+	if cancelAtEnd {
+		effectiveText = fmt.Sprintf("at the end of your current billing period (%s)", subscription.CurrentPeriodEnd.Format("January 2, 2006"))
+	}
+
+	message := fmt.Sprintf(`
+Dear %s %s,
+
+Your subscription has been canceled %s.
+
+We're sorry to see you go! Your premium features will remain available until %s.
+
+If you change your mind, you can reactivate your subscription anytime from your account settings.
+
+Best regards,
+The CloudDrive Team
+`, user.FirstName, user.LastName, effectiveText, subscription.CurrentPeriodEnd.Format("January 2, 2006"))
 
 	go s.emailService.SendNotificationEmail(ctx, user.Email, subject, message)
 }
 
 // sendReactivationEmail sends reactivation confirmation
 func (s *SubscriptionService) sendReactivationEmail(ctx context.Context, user *models.User, subscription *models.Subscription, plan *models.SubscriptionPlan) {
-	subject := "Subscription Reactivated"
+	subject := "Subscription Reactivated - Welcome Back!"
+
 	message := fmt.Sprintf(`
 Dear %s %s,
 
@@ -1099,7 +1279,7 @@ Welcome back to CloudDrive!
 
 Best regards,
 The CloudDrive Team
-`, user.FirstName, user.LastName, plan.Name, subscription.CurrentPeriodEnd.Format("2006-01-02"))
+`, user.FirstName, user.LastName, plan.Name, subscription.CurrentPeriodEnd.Format("January 2, 2006"))
 
 	go s.emailService.SendNotificationEmail(ctx, user.Email, subject, message)
 }
@@ -1116,7 +1296,7 @@ func (s *SubscriptionService) sendRenewalSuccessNotification(ctx context.Context
 		return
 	}
 
-	subject := "Subscription Renewed"
+	subject := "Subscription Renewed Successfully"
 	message := fmt.Sprintf(`
 Dear %s %s,
 
@@ -1132,13 +1312,13 @@ Thank you for continuing with CloudDrive!
 Best regards,
 The CloudDrive Team
 `, user.FirstName, user.LastName, plan.Name, float64(subscription.Amount)/100,
-		subscription.Currency, subscription.CurrentPeriodEnd.Format("2006-01-02"))
+		subscription.Currency, subscription.CurrentPeriodEnd.Format("January 2, 2006"))
 
 	go s.emailService.SendNotificationEmail(ctx, user.Email, subject, message)
 }
 
 // sendRenewalFailureNotification sends renewal failure notification
-func (s *SubscriptionService) sendRenewalFailureNotification(ctx context.Context, subscription *models.Subscription, _ error) {
+func (s *SubscriptionService) sendRenewalFailureNotification(ctx context.Context, subscription *models.Subscription, renewalErr error) {
 	user, userErr := s.userRepo.GetByID(ctx, subscription.UserID)
 	if userErr != nil {
 		return
@@ -1156,59 +1336,60 @@ Please update your payment information to continue enjoying CloudDrive premium f
 
 Best regards,
 The CloudDrive Team
-`, user.FirstName, user.LastName, subscription.CurrentPeriodEnd.Format("2006-01-02"))
+`, user.FirstName, user.LastName, subscription.CurrentPeriodEnd.Format("January 2, 2006"))
 
 	go s.emailService.SendNotificationEmail(ctx, user.Email, subject, message)
 }
 
-// Audit and Analytics Methods
+// ============================================================================
+// LOGGING AND ANALYTICS METHODS
+// ============================================================================
 
 // logAuditEvent logs an audit event
-func (s *SubscriptionService) logAuditEvent(ctx context.Context, userID primitive.ObjectID, action models.AuditAction, resourceType string, resourceID primitive.ObjectID, success bool, message string) {
+func (s *SubscriptionService) logAuditEvent(ctx context.Context, userID primitive.ObjectID, action, resource string, resourceID primitive.ObjectID, success bool, details string) {
 	auditLog := &models.AuditLog{
-		UserID:    &userID,
-		Action:    action,
-		Resource:  models.AuditResource{Type: resourceType, ID: resourceID},
-		Success:   success,
-		Severity:  models.AuditSeverityLow,
-		Timestamp: time.Now(),
+		UserID:     userID,
+		Action:     action,
+		Resource:   resource,
+		ResourceID: resourceID,
+		Success:    success,
+		Details:    details,
+		Timestamp:  time.Now(),
 	}
 
-	if !success {
-		auditLog.ErrorMessage = message
-		auditLog.Severity = models.AuditSeverityMedium
+	if err := s.auditRepo.Create(ctx, auditLog); err != nil {
+		s.logger.Error("Failed to create audit log", map[string]interface{}{
+			"user_id": userID.Hex(),
+			"action":  action,
+			"error":   err.Error(),
+		})
 	}
-
-	s.auditRepo.Create(ctx, auditLog)
 }
 
 // trackAnalytics tracks analytics event
-func (s *SubscriptionService) trackAnalytics(ctx context.Context, userID primitive.ObjectID, eventType models.AnalyticsEventType, action string, resourceID primitive.ObjectID, resourceName string) {
-	analytics := &models.Analytics{
-		UserID:    &userID,
-		EventType: eventType,
-		Action:    action,
-		Resource: models.AnalyticsResource{
-			Type: "subscription",
-			ID:   resourceID,
-			Name: resourceName,
-		},
-		Timestamp: time.Now(),
-	}
-
-	s.analyticsRepo.Create(ctx, analytics)
-}
-
-// logError logs an error
-func (s *SubscriptionService) logError(ctx context.Context, userID primitive.ObjectID, message string, err error) {
-	auditLog := &models.AuditLog{
-		UserID:       &userID,
-		Action:       models.AuditActionSecurityBreach,
-		Success:      false,
-		ErrorMessage: fmt.Sprintf("%s: %v", message, err),
-		Severity:     models.AuditSeverityHigh,
+func (s *SubscriptionService) trackAnalytics(ctx context.Context, userID primitive.ObjectID, eventType, action string, resourceID primitive.ObjectID, resourceName string) {
+	event := &models.AnalyticsEvent{
+		UserID:       userID,
+		EventType:    eventType,
+		Action:       action,
+		ResourceID:   resourceID,
+		ResourceName: resourceName,
 		Timestamp:    time.Now(),
 	}
 
-	s.auditRepo.Create(ctx, auditLog)
+	if err := s.analyticsRepo.TrackEvent(ctx, event); err != nil {
+		s.logger.Error("Failed to track analytics event", map[string]interface{}{
+			"user_id":    userID.Hex(),
+			"event_type": eventType,
+			"error":      err.Error(),
+		})
+	}
+}
+
+// logError logs an error with context
+func (s *SubscriptionService) logError(ctx context.Context, userID primitive.ObjectID, message string, err error) {
+	s.logger.Error(message, map[string]interface{}{
+		"user_id": userID.Hex(),
+		"error":   err.Error(),
+	})
 }
