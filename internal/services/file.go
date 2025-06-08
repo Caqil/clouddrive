@@ -287,6 +287,24 @@ func (s *FileService) RenameFile(ctx context.Context, userID primitive.ObjectID,
 	return s.fileRepo.GetByID(ctx, fileID)
 }
 
+// CopyFile creates a copy of a file
+func (s *FileService) CopyFile(ctx context.Context, userID primitive.ObjectID, fileID primitive.ObjectID, targetFolderID *primitive.ObjectID, newName string) (*models.File, error) {
+	// Get original file and verify ownership
+	originalFile, err := s.fileRepo.GetByID(ctx, fileID)
+	if err != nil {
+		return nil, err
+	}
+
+	if originalFile.UserID != userID {
+		return nil, pkg.ErrForbidden
+	}
+
+	// For now, return not implemented error
+	return nil, pkg.ErrInternalServer.WithDetails(map[string]interface{}{
+		"message": "File copy not yet fully implemented",
+	})
+}
+
 // MoveFile moves file to different folder
 func (s *FileService) MoveFile(ctx context.Context, userID primitive.ObjectID, fileID primitive.ObjectID, targetFolderID *primitive.ObjectID) (*models.File, error) {
 	// Get file and verify ownership

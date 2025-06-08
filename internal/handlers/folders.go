@@ -528,7 +528,6 @@ func (h *FolderHandler) DeleteFolder(c *gin.Context) {
 	// Check for force delete
 	force := c.Query("force") == "true"
 
-	var err error
 	if force {
 		// Force delete using service
 		err = h.folderService.ForceDeleteFolder(c.Request.Context(), userObjID, folderID)

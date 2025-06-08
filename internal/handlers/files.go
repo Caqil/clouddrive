@@ -293,12 +293,29 @@ func (h *FileHandler) CopyFile(c *gin.Context) {
 
 	userObjID := userID.(primitive.ObjectID)
 
-	// For now, return not implemented
-	// In a real implementation, you would:
-	// 1. Get the original file
-	// 2. Create a copy in storage
-	// 3. Create new file record
-	pkg.InternalServerErrorResponse(c, "File copy not yet implemented")
+	// Parse target folder ID if provided
+	var targetFolderID *primitive.ObjectID
+	if req.FolderID != nil && *req.FolderID != "" {
+		id, err := primitive.ObjectIDFromHex(*req.FolderID)
+		if err != nil {
+			pkg.BadRequestResponse(c, "Invalid target folder ID")
+			return
+		}
+		targetFolderID = &id
+	}
+
+	// Copy the file using the file service
+	copiedFile, err := h.fileService.CopyFile(c.Request.Context(), userObjID, fileID, targetFolderID, req.Name)
+	if err != nil {
+		if appErr, ok := pkg.IsAppError(err); ok {
+			pkg.ErrorResponseFromAppError(c, appErr)
+			return
+		}
+		pkg.InternalServerErrorResponse(c, "Failed to copy file")
+		return
+	}
+
+	pkg.CreatedResponse(c, "File copied successfully", copiedFile)
 }
 
 // DeleteFile deletes a file

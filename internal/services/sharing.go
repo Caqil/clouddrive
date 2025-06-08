@@ -26,6 +26,7 @@ type SharingService struct {
 
 // NewSharingService creates a new sharing service
 func NewSharingService(
+	userRepo repository.UserRepository,
 	shareRepo repository.ShareRepository,
 	fileRepo repository.FileRepository,
 	folderRepo repository.FolderRepository,
@@ -34,6 +35,7 @@ func NewSharingService(
 	emailService EmailService,
 ) *SharingService {
 	return &SharingService{
+		userRepo:      userRepo,
 		shareRepo:     shareRepo,
 		fileRepo:      fileRepo,
 		folderRepo:    folderRepo,
@@ -59,11 +61,60 @@ type CreateShareRequest struct {
 	Recipients     []string                 `json:"recipients,omitempty"`
 }
 
+// BulkCreateShareRequest represents bulk share creation request
+type BulkCreateShareRequest struct {
+	ResourceTypes  []models.ShareResourceType `json:"resourceTypes" validate:"required"`
+	ResourceIDs    []primitive.ObjectID       `json:"resourceIds" validate:"required"`
+	ShareType      models.ShareType           `json:"shareType" validate:"required,oneof=public private internal"`
+	Permission     models.SharePermission     `json:"permission" validate:"required,oneof=view download edit comment"`
+	Password       string                     `json:"password,omitempty"`
+	ExpiresAt      *time.Time                 `json:"expiresAt,omitempty"`
+	MaxDownloads   int                        `json:"maxDownloads,omitempty"`
+	AllowedIPs     []string                   `json:"allowedIPs,omitempty"`
+	AllowedDomains []string                   `json:"allowedDomains,omitempty"`
+	NotifyOnAccess bool                       `json:"notifyOnAccess"`
+	CustomMessage  string                     `json:"customMessage"`
+	Recipients     []string                   `json:"recipients,omitempty"`
+}
+
 // ShareResponse represents share response
 type ShareResponse struct {
 	*models.Share
 	ShareURL     string `json:"shareUrl"`
 	ResourceName string `json:"resourceName"`
+}
+
+// SharingOverview represents user's sharing activity overview
+type SharingOverview struct {
+	TotalShares        int64                 `json:"totalShares"`
+	ActiveShares       int64                 `json:"activeShares"`
+	ExpiredShares      int64                 `json:"expiredShares"`
+	TotalViews         int64                 `json:"totalViews"`
+	TotalDownloads     int64                 `json:"totalDownloads"`
+	RecentActivity     []*models.ShareAccess `json:"recentActivity"`
+	SharesByType       map[string]int64      `json:"sharesByType"`
+	SharesByPermission map[string]int64      `json:"sharesByPermission"`
+}
+
+// ShareStatistics represents share statistics
+type ShareStatistics struct {
+	ShareID        primitive.ObjectID    `json:"shareId"`
+	TotalViews     int                   `json:"totalViews"`
+	TotalDownloads int                   `json:"totalDownloads"`
+	UniqueVisitors int                   `json:"uniqueVisitors"`
+	AccessLog      []*models.ShareAccess `json:"accessLog"`
+	TopCountries   map[string]int        `json:"topCountries"`
+	AccessPattern  map[string]int        `json:"accessPattern"` // hourly access pattern
+}
+
+// BulkShareResult represents bulk share creation result
+type BulkShareResult struct {
+	Successful []ShareResponse `json:"successful"`
+	Failed     []struct {
+		ResourceID primitive.ObjectID `json:"resourceId"`
+		Error      string             `json:"error"`
+	} `json:"failed"`
+	TotalCreated int `json:"totalCreated"`
 }
 
 // CreateShare creates a new share
@@ -106,28 +157,7 @@ func (s *SharingService) CreateShare(ctx context.Context, userID primitive.Objec
 		return nil, pkg.ErrInternalServer.WithCause(err)
 	}
 
-	// Build share URL
-	shareURL := fmt.Sprintf("/share/%s", token)
-
-	// Hash password if provided
-	var hashedPassword string
-	if req.Password != "" {
-		hashedPassword, err = pkg.HashPassword(req.Password)
-		if err != nil {
-			return nil, pkg.ErrInternalServer.WithCause(err)
-		}
-	}
-
-	// Create recipients
-	var recipients []models.ShareRecipient
-	for _, email := range req.Recipients {
-		recipients = append(recipients, models.ShareRecipient{
-			Email:     email,
-			InvitedAt: time.Now(),
-		})
-	}
-
-	// Create share
+	// Build share model
 	share := &models.Share{
 		Token:          token,
 		ResourceType:   req.ResourceType,
@@ -135,7 +165,6 @@ func (s *SharingService) CreateShare(ctx context.Context, userID primitive.Objec
 		UserID:         userID,
 		ShareType:      req.ShareType,
 		Permission:     req.Permission,
-		Password:       hashedPassword,
 		HasPassword:    req.Password != "",
 		ExpiresAt:      req.ExpiresAt,
 		MaxDownloads:   req.MaxDownloads,
@@ -144,60 +173,51 @@ func (s *SharingService) CreateShare(ctx context.Context, userID primitive.Objec
 		IsActive:       true,
 		NotifyOnAccess: req.NotifyOnAccess,
 		CustomMessage:  req.CustomMessage,
-		Recipients:     recipients,
+		Recipients:     make([]models.ShareRecipient, 0),
+		AccessLog:      make([]models.ShareAccess, 0),
 	}
 
+	// Hash password if provided
+	if req.Password != "" {
+		hashedPassword, err := pkg.HashPassword(req.Password)
+		if err != nil {
+			return nil, pkg.ErrInternalServer.WithCause(err)
+		}
+		share.Password = hashedPassword
+	}
+
+	// Add recipients
+	for _, email := range req.Recipients {
+		recipient := models.ShareRecipient{
+			Email:     email,
+			InvitedAt: time.Now(),
+		}
+
+		// Try to find user by email
+		if user, err := s.userRepo.GetByEmail(ctx, email); err == nil {
+			recipient.UserID = &user.ID
+			recipient.Name = user.FirstName
+		}
+
+		share.Recipients = append(share.Recipients, recipient)
+	}
+
+	// Create share
 	if err := s.shareRepo.Create(ctx, share); err != nil {
 		return nil, err
-	}
-
-	// Send share notifications
-	if len(req.Recipients) > 0 {
-		for _, email := range req.Recipients {
-			// Prepare notification message
-			message := fmt.Sprintf("A %s has been shared with you: %s\n\nAccess it here: %s",
-				req.ResourceType, resourceName, shareURL)
-
-			// Use custom message if provided
-			if req.CustomMessage != "" {
-				message = fmt.Sprintf("%s\n\nMessage from sender: %s\n\nAccess it here: %s",
-					req.CustomMessage, resourceName, shareURL)
-			}
-
-			// Add password hint if share is password protected
-			if req.Password != "" {
-				message += "\n\nNote: This share is password protected. The sender should provide you with the password separately."
-			}
-
-			// Add expiration info if set
-			if req.ExpiresAt != nil {
-				message += fmt.Sprintf("\n\nThis share will expire on: %s",
-					req.ExpiresAt.Format("2006-01-02 15:04:05 UTC"))
-			}
-
-			// Send notification email asynchronously
-			go func(recipientEmail string) {
-				if err := s.emailService.SendNotificationEmail(ctx, recipientEmail,
-					fmt.Sprintf("%s Shared: %s", strings.Title(string(req.ResourceType)), resourceName),
-					message); err != nil {
-					// Log email sending error but don't fail the share creation
-					s.logAuditEvent(ctx, userID, models.AuditActionShareCreate, "email",
-						primitive.NilObjectID, false,
-						fmt.Sprintf("Failed to send share notification to %s: %v", recipientEmail, err))
-				}
-			}(email)
-		}
 	}
 
 	// Log audit event
 	s.logAuditEvent(ctx, userID, models.AuditActionShareCreate, string(req.ResourceType), req.ResourceID, true, "")
 
-	// Track analytics
-	s.trackAnalytics(ctx, userID, models.EventTypeFileShare, "create", req.ResourceID, resourceName)
+	// Send email notifications if recipients provided
+	if len(req.Recipients) > 0 {
+		s.sendShareNotifications(ctx, share, resourceName, req.Recipients)
+	}
 
 	return &ShareResponse{
 		Share:        share,
-		ShareURL:     shareURL,
+		ShareURL:     fmt.Sprintf("/share/%s", share.Token),
 		ResourceName: resourceName,
 	}, nil
 }
@@ -209,14 +229,14 @@ func (s *SharingService) GetShare(ctx context.Context, token string) (*ShareResp
 		return nil, err
 	}
 
+	// Check if share is expired
+	if share.ExpiresAt != nil && share.ExpiresAt.Before(time.Now()) {
+		return nil, pkg.ErrShareExpired
+	}
+
 	// Check if share is active
 	if !share.IsActive {
 		return nil, pkg.ErrShareNotFound
-	}
-
-	// Check if share has expired
-	if share.ExpiresAt != nil && share.ExpiresAt.Before(time.Now()) {
-		return nil, pkg.ErrShareExpired
 	}
 
 	// Check download limit
@@ -244,6 +264,41 @@ func (s *SharingService) GetShare(ctx context.Context, token string) (*ShareResp
 	return &ShareResponse{
 		Share:        share,
 		ShareURL:     fmt.Sprintf("/share/%s", token),
+		ResourceName: resourceName,
+	}, nil
+}
+
+// GetUserShare retrieves share by ID for a specific user
+func (s *SharingService) GetUserShare(ctx context.Context, userID, shareID primitive.ObjectID) (*ShareResponse, error) {
+	share, err := s.shareRepo.GetByID(ctx, shareID)
+	if err != nil {
+		return nil, err
+	}
+
+	if share.UserID != userID {
+		return nil, pkg.ErrForbidden
+	}
+
+	// Get resource name
+	var resourceName string
+	switch share.ResourceType {
+	case models.ShareResourceFile:
+		file, err := s.fileRepo.GetByID(ctx, share.ResourceID)
+		if err != nil {
+			return nil, err
+		}
+		resourceName = file.Name
+	case models.ShareResourceFolder:
+		folder, err := s.folderRepo.GetByID(ctx, share.ResourceID)
+		if err != nil {
+			return nil, err
+		}
+		resourceName = folder.Name
+	}
+
+	return &ShareResponse{
+		Share:        share,
+		ShareURL:     fmt.Sprintf("/share/%s", share.Token),
 		ResourceName: resourceName,
 	}, nil
 }
@@ -281,16 +336,9 @@ func (s *SharingService) AccessShare(ctx context.Context, token, password, ip, u
 		}
 	}
 
-	// Check domain restrictions (extract domain from user agent or referrer)
+	// Check domain restrictions
 	if len(share.AllowedDomains) > 0 {
-		// Extract domain from IP or implement domain checking logic
-		// This could be enhanced to check the referrer header or implement
-		// more sophisticated domain validation
 		allowed := false
-
-		// For now, we'll check if the user agent contains allowed domains
-		// In a real implementation, you might want to check the referrer header
-		// or implement reverse DNS lookup for IP-to-domain mapping
 		userAgentLower := strings.ToLower(userAgent)
 		for _, allowedDomain := range share.AllowedDomains {
 			if strings.Contains(userAgentLower, strings.ToLower(allowedDomain)) {
@@ -298,7 +346,6 @@ func (s *SharingService) AccessShare(ctx context.Context, token, password, ip, u
 				break
 			}
 		}
-
 		if !allowed {
 			return nil, pkg.ErrForbidden.WithDetails(map[string]interface{}{
 				"message": "Access denied: Domain not allowed",
@@ -306,195 +353,66 @@ func (s *SharingService) AccessShare(ctx context.Context, token, password, ip, u
 		}
 	}
 
-	// Extract additional info from user agent for better tracking
-	var country, city string
-	// In a real implementation, you might use a GeoIP service like MaxMind
-	// to get location information from the IP address
-	// For now, we'll leave these empty or use placeholder values
-	if ip != "" {
-		// Placeholder for GeoIP lookup
-		// country, city = geoIPLookup(ip)
-	}
-
-	// Log access with enhanced information
+	// Log access
 	access := models.ShareAccess{
 		IP:         ip,
 		UserAgent:  userAgent,
-		Country:    country,
-		City:       city,
 		AccessedAt: time.Now(),
 		Action:     "view",
 	}
 
-	// Add access log and update view count
 	if err := s.shareRepo.AddAccessLog(ctx, share.ID, access); err != nil {
-		// Log error but don't fail the request
 		s.logAuditEvent(ctx, share.UserID, models.AuditActionShareAccess, "share", share.ID, false, fmt.Sprintf("Failed to log access: %v", err))
 	}
 
 	if err := s.shareRepo.UpdateViewCount(ctx, share.ID); err != nil {
-		// Log error but don't fail the request
 		s.logAuditEvent(ctx, share.UserID, models.AuditActionShareAccess, "share", share.ID, false, fmt.Sprintf("Failed to update view count: %v", err))
 	}
 
 	// Send notification if enabled
 	if share.NotifyOnAccess {
-		// Get share owner information
-		shareOwner, err := s.userRepo.GetByID(ctx, share.UserID)
-		if err != nil {
-			// Log error but don't fail the share access
-			s.logAuditEvent(ctx, share.UserID, models.AuditActionShareAccess, "share", share.ID, false, fmt.Sprintf("Failed to get share owner for notification: %v", err))
-		} else {
-			// Get resource name for the notification
-			var resourceName string
-			switch share.ResourceType {
-			case models.ShareResourceFile:
-				if file, err := s.fileRepo.GetByID(ctx, share.ResourceID); err == nil {
-					resourceName = file.Name
-				}
-			case models.ShareResourceFolder:
-				if folder, err := s.folderRepo.GetByID(ctx, share.ResourceID); err == nil {
-					resourceName = folder.Name
-				}
-			}
-
-			// Send notification email
-			subject := "Share Access Notification"
-			message := fmt.Sprintf(
-				"Your shared %s '%s' was accessed.\n\n"+
-					"Access Details:\n"+
-					"- Time: %s\n"+
-					"- IP Address: %s\n"+
-					"- User Agent: %s\n"+
-					"- Location: %s, %s\n\n"+
-					"If this was not expected, you can revoke the share link in your dashboard.",
-				share.ResourceType,
-				resourceName,
-				access.AccessedAt.Format("2006-01-02 15:04:05 UTC"),
-				ip,
-				userAgent,
-				city,
-				country,
-			)
-
-			// Send notification asynchronously to not block the share access
-			go func() {
-				if err := s.emailService.SendNotificationEmail(context.Background(), shareOwner.Email, subject, message); err != nil {
-					// Log email sending error
-					s.logAuditEvent(context.Background(), share.UserID, models.AuditActionShareAccess, "share", share.ID, false, fmt.Sprintf("Failed to send access notification: %v", err))
-				}
-			}()
-		}
+		s.sendAccessNotification(ctx, share.Share, ip, userAgent)
 	}
-
-	// Track analytics
-	s.trackAnalytics(ctx, primitive.NilObjectID, models.EventTypeShareAccess, "view", share.ResourceID, share.ResourceName)
-
-	// Log successful access in audit log
-	s.logAuditEvent(ctx, share.UserID, models.AuditActionShareAccess, "share", share.ID, true, fmt.Sprintf("Share accessed from IP: %s", ip))
 
 	return share, nil
 }
 
-// Helper function to extract domain from referrer or user agent
-func (s *SharingService) extractDomainFromRequest(userAgent, referrer string) string {
-	// Check referrer first
-	if referrer != "" {
-		// Parse the referrer URL to extract domain
-		if strings.HasPrefix(referrer, "http://") || strings.HasPrefix(referrer, "https://") {
-			parts := strings.Split(referrer, "/")
-			if len(parts) >= 3 {
-				domain := parts[2]
-				// Remove port if present
-				if colonIndex := strings.Index(domain, ":"); colonIndex != -1 {
-					domain = domain[:colonIndex]
-				}
-				return domain
-			}
-		}
-	}
-
-	// Fallback to extracting domain hints from user agent
-	// This is less reliable but can be useful for mobile apps
-	userAgentLower := strings.ToLower(userAgent)
-
-	// Common patterns in user agents that might indicate domain/app
-	if strings.Contains(userAgentLower, "example.com") {
-		return "example.com"
-	}
-
-	// Add more domain extraction logic as needed
-	return ""
-}
-
-// Enhanced tracking method for share access
-func (s *SharingService) trackShareAccess(ctx context.Context, share *models.Share, ip, userAgent, action string) {
-	metadata := map[string]interface{}{
-		"ip":         ip,
-		"user_agent": userAgent,
-		"action":     action,
-		"share_type": share.ShareType,
-		"permission": share.Permission,
-	}
-
-	analytics := &models.Analytics{
-		UserID:    nil, // Anonymous access
-		EventType: models.EventTypeShareAccess,
-		Action:    action,
-		Resource: models.AnalyticsResource{
-			Type: "share",
-			ID:   share.ID,
-			Name: share.CustomMessage, // Use custom message as name for shares
-		},
-		Metadata:  metadata,
-		IP:        ip,
-		UserAgent: userAgent,
-		Timestamp: time.Now(),
-	}
-
-	s.analyticsRepo.Create(ctx, analytics)
-}
-
-// DownloadSharedResource downloads a shared resource
-func (s *SharingService) DownloadSharedResource(ctx context.Context, token, password, ip, userAgent string) (string, error) {
-	// Access share first
+// DownloadShare generates download URL for shared resource
+func (s *SharingService) DownloadShare(ctx context.Context, token, password, ip, userAgent string) (string, error) {
 	share, err := s.AccessShare(ctx, token, password, ip, userAgent)
 	if err != nil {
 		return "", err
 	}
 
-	// Check download permission
-	if share.Permission == models.SharePermissionView {
-		return "", pkg.ErrForbidden
+	// Check if download permission is allowed
+	if share.Permission != models.SharePermissionDownload && share.Permission != models.SharePermissionEdit {
+		return "", pkg.ErrForbidden.WithDetails(map[string]interface{}{
+			"message": "Download not allowed for this share",
+		})
 	}
 
 	// Update download count
-	s.shareRepo.UpdateDownloadCount(ctx, share.ID)
-
-	// Log download access
-	access := models.ShareAccess{
-		IP:         ip,
-		UserAgent:  userAgent,
-		AccessedAt: time.Now(),
-		Action:     "download",
+	if err := s.shareRepo.UpdateDownloadCount(ctx, share.ID); err != nil {
+		s.logAuditEvent(ctx, share.UserID, models.AuditActionShareAccess, "share", share.ID, false, fmt.Sprintf("Failed to update download count: %v", err))
 	}
-	s.shareRepo.AddAccessLog(ctx, share.ID, access)
 
-	// For files, return download URL
-	if share.ResourceType == models.ShareResourceFile {
+	// Generate download URL based on resource type
+	switch share.ResourceType {
+	case models.ShareResourceFile:
 		file, err := s.fileRepo.GetByID(ctx, share.ResourceID)
 		if err != nil {
 			return "", err
 		}
-
 		// This would integrate with storage service to get download URL
 		downloadURL := fmt.Sprintf("/api/files/%s/download", file.ID.Hex())
 		return downloadURL, nil
+	case models.ShareResourceFolder:
+		// For folders, create zip and return download URL
+		// This would be implemented to zip folder contents
+		return "", pkg.ErrInternalServer
 	}
 
-	// For folders, create zip and return download URL
-	// This would be implemented to zip folder contents
-	return "", pkg.ErrInternalServer
+	return "", pkg.ErrInvalidInput
 }
 
 // ListUserShares lists user's shares
@@ -506,7 +424,6 @@ func (s *SharingService) ListUserShares(ctx context.Context, userID primitive.Ob
 
 	var responses []*ShareResponse
 	for _, share := range shares {
-		// Get resource name
 		var resourceName string
 		switch share.ResourceType {
 		case models.ShareResourceFile:
@@ -565,29 +482,7 @@ func (s *SharingService) UpdateShare(ctx context.Context, userID primitive.Objec
 	s.logAuditEvent(ctx, userID, models.AuditActionShareUpdate, string(share.ResourceType), share.ResourceID, true, "")
 
 	// Get updated share
-	updatedShare, err := s.shareRepo.GetByID(ctx, shareID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get resource name
-	var resourceName string
-	switch updatedShare.ResourceType {
-	case models.ShareResourceFile:
-		if file, err := s.fileRepo.GetByID(ctx, updatedShare.ResourceID); err == nil {
-			resourceName = file.Name
-		}
-	case models.ShareResourceFolder:
-		if folder, err := s.folderRepo.GetByID(ctx, updatedShare.ResourceID); err == nil {
-			resourceName = folder.Name
-		}
-	}
-
-	return &ShareResponse{
-		Share:        updatedShare,
-		ShareURL:     fmt.Sprintf("/share/%s", updatedShare.Token),
-		ResourceName: resourceName,
-	}, nil
+	return s.GetUserShare(ctx, userID, shareID)
 }
 
 // DeleteShare deletes a share
@@ -613,22 +508,493 @@ func (s *SharingService) DeleteShare(ctx context.Context, userID primitive.Objec
 	return nil
 }
 
-// CleanupExpiredShares removes expired shares
-func (s *SharingService) CleanupExpiredShares(ctx context.Context) error {
-	expiredShares, err := s.shareRepo.GetExpiredShares(ctx)
+// RevokeAllShares revokes all shares for a resource
+func (s *SharingService) RevokeAllShares(ctx context.Context, userID primitive.ObjectID, resourceType models.ShareResourceType, resourceID primitive.ObjectID) (int, error) {
+	// Verify user owns the resource
+	switch resourceType {
+	case models.ShareResourceFile:
+		file, err := s.fileRepo.GetByID(ctx, resourceID)
+		if err != nil {
+			return 0, err
+		}
+		if file.UserID != userID {
+			return 0, pkg.ErrForbidden
+		}
+	case models.ShareResourceFolder:
+		folder, err := s.folderRepo.GetByID(ctx, resourceID)
+		if err != nil {
+			return 0, err
+		}
+		if folder.UserID != userID {
+			return 0, pkg.ErrForbidden
+		}
+	}
+
+	// Get all shares for the resource
+	shares, err := s.shareRepo.ListByResource(ctx, resourceType, resourceID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	for _, share := range expiredShares {
-		s.shareRepo.SoftDelete(ctx, share.ID)
+	count := 0
+	for _, share := range shares {
+		if err := s.shareRepo.SoftDelete(ctx, share.ID); err != nil {
+			continue // Log error but continue with others
+		}
+		count++
 	}
 
-	return nil
+	// Log audit event
+	s.logAuditEvent(ctx, userID, models.AuditActionShareDelete, string(resourceType), resourceID, true, fmt.Sprintf("Revoked %d shares", count))
+
+	return count, nil
 }
 
-// logAuditEvent logs an audit event
-func (s *SharingService) logAuditEvent(ctx context.Context, userID primitive.ObjectID, action models.AuditAction, resourceType string, resourceID primitive.ObjectID, success bool, message string) {
+// GetSharingOverview gets overview of user's sharing activity
+func (s *SharingService) GetSharingOverview(ctx context.Context, userID primitive.ObjectID) (*SharingOverview, error) {
+	// Get user shares with no pagination limit to calculate totals
+	params := &pkg.PaginationParams{
+		Page:  1,
+		Limit: 1000, // High limit to get most shares
+	}
+
+	shares, totalShares, err := s.shareRepo.ListByUser(ctx, userID, params)
+	if err != nil {
+		return nil, err
+	}
+
+	overview := &SharingOverview{
+		TotalShares:        totalShares,
+		SharesByType:       make(map[string]int64),
+		SharesByPermission: make(map[string]int64),
+		RecentActivity:     make([]*models.ShareAccess, 0),
+	}
+
+	var totalViews, totalDownloads int64
+	activeShares := int64(0)
+	expiredShares := int64(0)
+
+	for _, share := range shares {
+		// Count by type
+		overview.SharesByType[string(share.ShareType)]++
+
+		// Count by permission
+		overview.SharesByPermission[string(share.Permission)]++
+
+		// Count views and downloads
+		totalViews += int64(share.ViewCount)
+		totalDownloads += int64(share.DownloadCount)
+
+		// Check if active or expired
+		if share.ExpiresAt != nil && share.ExpiresAt.Before(time.Now()) {
+			expiredShares++
+		} else if share.IsActive {
+			activeShares++
+		}
+
+		// Collect recent activity (last 10 access logs)
+		if len(share.AccessLog) > 0 {
+			for i := len(share.AccessLog) - 1; i >= 0 && len(overview.RecentActivity) < 10; i-- {
+				overview.RecentActivity = append(overview.RecentActivity, &share.AccessLog[i])
+			}
+		}
+	}
+
+	overview.ActiveShares = activeShares
+	overview.ExpiredShares = expiredShares
+	overview.TotalViews = totalViews
+	overview.TotalDownloads = totalDownloads
+
+	return overview, nil
+}
+
+// GetShareLink gets or regenerates a share link
+func (s *SharingService) GetShareLink(ctx context.Context, userID, shareID primitive.ObjectID, regenerate bool) (string, error) {
+	share, err := s.shareRepo.GetByID(ctx, shareID)
+	if err != nil {
+		return "", err
+	}
+
+	if share.UserID != userID {
+		return "", pkg.ErrForbidden
+	}
+
+	if regenerate {
+		// Generate new token
+		newToken, err := pkg.GenerateSecureToken(32)
+		if err != nil {
+			return "", pkg.ErrInternalServer.WithCause(err)
+		}
+
+		updates := map[string]interface{}{
+			"token": newToken,
+		}
+
+		if err := s.shareRepo.Update(ctx, shareID, updates); err != nil {
+			return "", err
+		}
+
+		// Log audit event
+		s.logAuditEvent(ctx, userID, models.AuditActionShareUpdate, "share", shareID, true, "Regenerated share link")
+
+		return fmt.Sprintf("/share/%s", newToken), nil
+	}
+
+	return fmt.Sprintf("/share/%s", share.Token), nil
+}
+
+// ValidateAccess validates access to a shared resource
+func (s *SharingService) ValidateAccess(ctx context.Context, token, password, ip, userAgent string) (*ShareResponse, error) {
+	return s.AccessShare(ctx, token, password, ip, userAgent)
+}
+
+// GetShareStatistics retrieves share statistics
+func (s *SharingService) GetShareStatistics(ctx context.Context, userID, shareID primitive.ObjectID) (*ShareStatistics, error) {
+	share, err := s.shareRepo.GetByID(ctx, shareID)
+	if err != nil {
+		return nil, err
+	}
+
+	if share.UserID != userID {
+		return nil, pkg.ErrForbidden
+	}
+
+	// Calculate unique visitors
+	uniqueIPs := make(map[string]bool)
+	topCountries := make(map[string]int)
+	accessPattern := make(map[string]int)
+
+	for _, access := range share.AccessLog {
+		uniqueIPs[access.IP] = true
+		if access.Country != "" {
+			topCountries[access.Country]++
+		}
+
+		// Group by hour for access pattern
+		hour := access.AccessedAt.Format("15")
+		accessPattern[hour]++
+	}
+
+	stats := &ShareStatistics{
+		ShareID:        shareID,
+		TotalViews:     share.ViewCount,
+		TotalDownloads: share.DownloadCount,
+		UniqueVisitors: len(uniqueIPs),
+		AccessLog:      make([]*models.ShareAccess, len(share.AccessLog)),
+		TopCountries:   topCountries,
+		AccessPattern:  accessPattern,
+	}
+
+	// Convert access log
+	for i, access := range share.AccessLog {
+		stats.AccessLog[i] = &access
+	}
+
+	return stats, nil
+}
+
+// GetShareAccessLogs retrieves share access logs
+func (s *SharingService) GetShareAccessLogs(ctx context.Context, userID, shareID primitive.ObjectID, params *pkg.PaginationParams) ([]*models.ShareAccess, int64, error) {
+	share, err := s.shareRepo.GetByID(ctx, shareID)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if share.UserID != userID {
+		return nil, 0, pkg.ErrForbidden
+	}
+
+	// For pagination, we need to slice the access log
+	total := int64(len(share.AccessLog))
+	start := (params.Page - 1) * params.Limit
+	end := start + params.Limit
+
+	if start >= int(total) {
+		return []*models.ShareAccess{}, total, nil
+	}
+
+	if end > int(total) {
+		end = int(total)
+	}
+
+	// Reverse order to show most recent first
+	logs := make([]*models.ShareAccess, 0)
+	for i := len(share.AccessLog) - 1; i >= 0; i-- {
+		logs = append(logs, &share.AccessLog[i])
+	}
+
+	// Apply pagination
+	pagedLogs := logs[start:end]
+
+	return pagedLogs, total, nil
+}
+
+// BulkCreateShares creates multiple shares at once
+func (s *SharingService) BulkCreateShares(ctx context.Context, userID primitive.ObjectID, req *BulkCreateShareRequest) (*BulkShareResult, error) {
+	result := &BulkShareResult{
+		Successful: make([]ShareResponse, 0),
+		Failed: make([]struct {
+			ResourceID primitive.ObjectID `json:"resourceId"`
+			Error      string             `json:"error"`
+		}, 0),
+		TotalCreated: 0,
+	}
+
+	for i, resourceID := range req.ResourceIDs {
+		if i >= len(req.ResourceTypes) {
+			break
+		}
+
+		createReq := &CreateShareRequest{
+			ResourceType:   req.ResourceTypes[i],
+			ResourceID:     resourceID,
+			ShareType:      req.ShareType,
+			Permission:     req.Permission,
+			Password:       req.Password,
+			ExpiresAt:      req.ExpiresAt,
+			MaxDownloads:   req.MaxDownloads,
+			AllowedIPs:     req.AllowedIPs,
+			AllowedDomains: req.AllowedDomains,
+			NotifyOnAccess: req.NotifyOnAccess,
+			CustomMessage:  req.CustomMessage,
+			Recipients:     req.Recipients,
+		}
+
+		share, err := s.CreateShare(ctx, userID, createReq)
+		if err != nil {
+			result.Failed = append(result.Failed, struct {
+				ResourceID primitive.ObjectID `json:"resourceId"`
+				Error      string             `json:"error"`
+			}{
+				ResourceID: resourceID,
+				Error:      err.Error(),
+			})
+		} else {
+			result.Successful = append(result.Successful, *share)
+			result.TotalCreated++
+		}
+	}
+
+	return result, nil
+}
+
+// AddComment adds a comment to a shared resource
+func (s *SharingService) AddComment(ctx context.Context, token, content, author, email, ip, userAgent string) (*models.ShareAccess, error) {
+	share, err := s.shareRepo.GetByToken(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if comments are allowed
+	if share.Permission != models.SharePermissionComment && share.Permission != models.SharePermissionEdit {
+		return nil, pkg.ErrForbidden.WithDetails(map[string]interface{}{
+			"message": "Comments not allowed for this share",
+		})
+	}
+
+	// Create comment as access log entry
+	comment := models.ShareAccess{
+		IP:         ip,
+		UserAgent:  userAgent,
+		AccessedAt: time.Now(),
+		Action:     "comment",
+		Email:      email,
+	}
+
+	if err := s.shareRepo.AddAccessLog(ctx, share.ID, comment); err != nil {
+		return nil, err
+	}
+
+	// Log audit event
+	s.logAuditEvent(ctx, share.UserID, models.AuditActionShareAccess, "share", share.ID, true, fmt.Sprintf("Comment by %s", author))
+
+	return &comment, nil
+}
+
+// GetComments retrieves comments for a shared resource
+func (s *SharingService) GetComments(ctx context.Context, token string, params *pkg.PaginationParams) ([]*models.ShareAccess, int64, error) {
+	share, err := s.shareRepo.GetByToken(ctx, token)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Filter access log for comments only
+	comments := make([]*models.ShareAccess, 0)
+	for _, access := range share.AccessLog {
+		if access.Action == "comment" {
+			comments = append(comments, &access)
+		}
+	}
+
+	total := int64(len(comments))
+	start := (params.Page - 1) * params.Limit
+	end := start + params.Limit
+
+	if start >= int(total) {
+		return []*models.ShareAccess{}, total, nil
+	}
+
+	if end > int(total) {
+		end = int(total)
+	}
+
+	// Apply pagination (reverse order for newest first)
+	paginatedComments := make([]*models.ShareAccess, 0)
+	for i := len(comments) - 1; i >= 0; i-- {
+		if len(paginatedComments) >= params.Limit {
+			break
+		}
+		if len(paginatedComments) >= start {
+			paginatedComments = append(paginatedComments, comments[i])
+		}
+	}
+
+	return paginatedComments[start:end], total, nil
+}
+
+// AddRecipients adds recipients to an existing share
+func (s *SharingService) AddRecipients(ctx context.Context, userID, shareID primitive.ObjectID, emails []string, message string, notifyByEmail bool) (*ShareResponse, error) {
+	share, err := s.shareRepo.GetByID(ctx, shareID)
+	if err != nil {
+		return nil, err
+	}
+
+	if share.UserID != userID {
+		return nil, pkg.ErrForbidden
+	}
+
+	// Add new recipients
+	newRecipients := make([]models.ShareRecipient, 0)
+	for _, email := range emails {
+		// Check if recipient already exists
+		exists := false
+		for _, existing := range share.Recipients {
+			if existing.Email == email {
+				exists = true
+				break
+			}
+		}
+
+		if !exists {
+			recipient := models.ShareRecipient{
+				Email:     email,
+				InvitedAt: time.Now(),
+			}
+
+			// Try to find user by email
+			if user, err := s.userRepo.GetByEmail(ctx, email); err == nil {
+				recipient.UserID = &user.ID
+				recipient.Name = user.FirstName
+			}
+
+			newRecipients = append(newRecipients, recipient)
+		}
+	}
+
+	// Update share with new recipients
+	allRecipients := append(share.Recipients, newRecipients...)
+	updates := map[string]interface{}{
+		"recipients": allRecipients,
+	}
+
+	if err := s.shareRepo.Update(ctx, shareID, updates); err != nil {
+		return nil, err
+	}
+
+	// Send notifications if requested
+	if notifyByEmail && len(newRecipients) > 0 {
+		resourceName := s.getResourceName(ctx, share.ResourceType, share.ResourceID)
+		s.sendShareNotifications(ctx, share, resourceName, emails)
+	}
+
+	// Log audit event
+	s.logAuditEvent(ctx, userID, models.AuditActionShareUpdate, "share", shareID, true, fmt.Sprintf("Added %d recipients", len(newRecipients)))
+
+	return s.GetUserShare(ctx, userID, shareID)
+}
+
+// RemoveRecipients removes recipients from a share
+func (s *SharingService) RemoveRecipients(ctx context.Context, userID, shareID primitive.ObjectID, emails []string) (*ShareResponse, error) {
+	share, err := s.shareRepo.GetByID(ctx, shareID)
+	if err != nil {
+		return nil, err
+	}
+
+	if share.UserID != userID {
+		return nil, pkg.ErrForbidden
+	}
+
+	// Filter out recipients to remove
+	filteredRecipients := make([]models.ShareRecipient, 0)
+	removedCount := 0
+
+	for _, recipient := range share.Recipients {
+		shouldRemove := false
+		for _, email := range emails {
+			if recipient.Email == email {
+				shouldRemove = true
+				removedCount++
+				break
+			}
+		}
+
+		if !shouldRemove {
+			filteredRecipients = append(filteredRecipients, recipient)
+		}
+	}
+
+	// Update share
+	updates := map[string]interface{}{
+		"recipients": filteredRecipients,
+	}
+
+	if err := s.shareRepo.Update(ctx, shareID, updates); err != nil {
+		return nil, err
+	}
+
+	// Log audit event
+	s.logAuditEvent(ctx, userID, models.AuditActionShareUpdate, "share", shareID, true, fmt.Sprintf("Removed %d recipients", removedCount))
+
+	return s.GetUserShare(ctx, userID, shareID)
+}
+
+// CloneShare creates a copy of an existing share with new settings
+func (s *SharingService) CloneShare(ctx context.Context, userID, shareID primitive.ObjectID, overrides interface{}) (*ShareResponse, error) {
+	originalShare, err := s.shareRepo.GetByID(ctx, shareID)
+	if err != nil {
+		return nil, err
+	}
+
+	if originalShare.UserID != userID {
+		return nil, pkg.ErrForbidden
+	}
+
+	// Create new share request based on original
+	createReq := &CreateShareRequest{
+		ResourceType:   originalShare.ResourceType,
+		ResourceID:     originalShare.ResourceID,
+		ShareType:      originalShare.ShareType,
+		Permission:     originalShare.Permission,
+		Password:       "", // Don't copy password
+		ExpiresAt:      originalShare.ExpiresAt,
+		MaxDownloads:   originalShare.MaxDownloads,
+		AllowedIPs:     originalShare.AllowedIPs,
+		AllowedDomains: originalShare.AllowedDomains,
+		NotifyOnAccess: originalShare.NotifyOnAccess,
+		CustomMessage:  originalShare.CustomMessage,
+		Recipients:     make([]string, 0), // Don't copy recipients
+	}
+
+	// Apply overrides if provided
+	// This would require type assertion based on the overrides structure
+	// For now, we'll create with original settings
+
+	return s.CreateShare(ctx, userID, createReq)
+}
+
+// Helper methods
+
+func (s *SharingService) logAuditEvent(ctx context.Context, userID primitive.ObjectID, action models.AuditAction, resourceType string, resourceID primitive.ObjectID, success bool, details string) {
 	auditLog := &models.AuditLog{
 		UserID:    &userID,
 		Action:    action,
@@ -639,26 +1005,85 @@ func (s *SharingService) logAuditEvent(ctx context.Context, userID primitive.Obj
 	}
 
 	if !success {
-		auditLog.ErrorMessage = message
+		auditLog.ErrorMessage = details
 		auditLog.Severity = models.AuditSeverityMedium
 	}
 
+	// Log audit event (ignore errors as this shouldn't fail the main operation)
 	s.auditRepo.Create(ctx, auditLog)
 }
 
-// trackAnalytics tracks analytics event
-func (s *SharingService) trackAnalytics(ctx context.Context, userID primitive.ObjectID, eventType models.AnalyticsEventType, action string, resourceID primitive.ObjectID, resourceName string) {
-	analytics := &models.Analytics{
-		UserID:    &userID,
-		EventType: eventType,
-		Action:    action,
-		Resource: models.AnalyticsResource{
-			Type: "share",
-			ID:   resourceID,
-			Name: resourceName,
-		},
-		Timestamp: time.Now(),
+func (s *SharingService) getResourceName(ctx context.Context, resourceType models.ShareResourceType, resourceID primitive.ObjectID) string {
+	switch resourceType {
+	case models.ShareResourceFile:
+		if file, err := s.fileRepo.GetByID(ctx, resourceID); err == nil {
+			return file.Name
+		}
+	case models.ShareResourceFolder:
+		if folder, err := s.folderRepo.GetByID(ctx, resourceID); err == nil {
+			return folder.Name
+		}
+	}
+	return "Unknown"
+}
+
+func (s *SharingService) sendShareNotifications(ctx context.Context, share *models.Share, resourceName string, emails []string) {
+	// Send email notifications to recipients
+	subject := fmt.Sprintf("You've been shared a %s: %s", share.ResourceType, resourceName)
+	shareURL := fmt.Sprintf("/share/%s", share.Token)
+
+	for _, email := range emails {
+		message := fmt.Sprintf(
+			"You have been shared a %s titled '%s'.\n\n"+
+				"Access the share: %s\n\n"+
+				"Share details:\n"+
+				"- Permission: %s\n"+
+				"- Expires: %s\n\n"+
+				"%s",
+			share.ResourceType,
+			resourceName,
+			shareURL,
+			share.Permission,
+			func() string {
+				if share.ExpiresAt != nil {
+					return share.ExpiresAt.Format("2006-01-02 15:04:05")
+				}
+				return "Never"
+			}(),
+			share.CustomMessage,
+		)
+
+		// Send email (ignore errors as this shouldn't fail the share creation)
+		if err := s.emailService.SendNotificationEmail(ctx, email, subject, message); err != nil {
+			s.logAuditEvent(ctx, share.UserID, models.AuditActionShareAccess, "email", share.ID, false, fmt.Sprintf("Failed to send notification to %s: %v", email, err))
+		}
+	}
+}
+
+func (s *SharingService) sendAccessNotification(ctx context.Context, share *models.Share, ip, userAgent string) {
+	// Get share owner
+	shareOwner, err := s.userRepo.GetByID(ctx, share.UserID)
+	if err != nil {
+		return
 	}
 
-	s.analyticsRepo.Create(ctx, analytics)
+	resourceName := s.getResourceName(ctx, share.ResourceType, share.ResourceID)
+
+	subject := "Share Access Notification"
+	message := fmt.Sprintf(
+		"Your shared %s '%s' was accessed.\n\n"+
+			"Access Details:\n"+
+			"- Time: %s\n"+
+			"- IP Address: %s\n"+
+			"- User Agent: %s\n\n"+
+			"If this was not expected, you can revoke the share link in your dashboard.",
+		share.ResourceType,
+		resourceName,
+		time.Now().Format("2006-01-02 15:04:05"),
+		ip,
+		userAgent,
+	)
+
+	// Send notification email (ignore errors)
+	s.emailService.SendNotificationEmail(ctx, shareOwner.Email, subject, message)
 }
