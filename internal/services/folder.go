@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/Caqil/clouddrive/internal/models"
@@ -18,6 +17,7 @@ import (
 type FolderService struct {
 	folderRepo    repository.FolderRepository
 	fileRepo      repository.FileRepository
+	userRepo      repository.UserRepository
 	auditRepo     repository.AuditLogRepository
 	analyticsRepo repository.AnalyticsRepository
 }
@@ -26,12 +26,14 @@ type FolderService struct {
 func NewFolderService(
 	folderRepo repository.FolderRepository,
 	fileRepo repository.FileRepository,
+	userRepo repository.UserRepository,
 	auditRepo repository.AuditLogRepository,
 	analyticsRepo repository.AnalyticsRepository,
 ) *FolderService {
 	return &FolderService{
 		folderRepo:    folderRepo,
 		fileRepo:      fileRepo,
+		userRepo:      userRepo,
 		auditRepo:     auditRepo,
 		analyticsRepo: analyticsRepo,
 	}
@@ -52,6 +54,30 @@ type FolderTree struct {
 	*models.Folder
 	Children []*FolderTree `json:"children"`
 }
+
+// FolderStatistics represents folder statistics
+type FolderStatistics struct {
+	TotalFiles     int64             `json:"totalFiles"`
+	TotalFolders   int64             `json:"totalFolders"`
+	TotalSize      int64             `json:"totalSize"`
+	FilesByType    map[string]int64  `json:"filesByType"`
+	RecentActivity []models.AuditLog `json:"recentActivity"`
+	StorageUsage   int64             `json:"storageUsage"`
+	LastModified   time.Time         `json:"lastModified"`
+	ShareCount     int64             `json:"shareCount"`
+	AccessCount    int64             `json:"accessCount"`
+}
+
+// BulkOperationResult represents bulk operation result
+type BulkOperationResult struct {
+	Successful []string                 `json:"successful"`
+	Failed     []map[string]interface{} `json:"failed"`
+	Total      int                      `json:"total"`
+}
+
+// ============================================================================
+// CORE FOLDER OPERATIONS
+// ============================================================================
 
 // CreateFolder creates a new folder
 func (s *FolderService) CreateFolder(ctx context.Context, userID primitive.ObjectID, req *CreateFolderRequest) (*models.Folder, error) {
@@ -174,10 +200,11 @@ func (s *FolderService) GetFolderContents(ctx context.Context, userID primitive.
 	}
 
 	return map[string]interface{}{
-		"folder":     folder,
-		"subfolders": subfolders,
-		"files":      files,
-		"totalFiles": totalFiles,
+		"folder":       folder,
+		"subfolders":   subfolders,
+		"files":        files,
+		"totalFiles":   totalFiles,
+		"totalFolders": len(subfolders),
 	}, nil
 }
 
@@ -218,29 +245,6 @@ func (s *FolderService) GetFolderTree(ctx context.Context, userID primitive.Obje
 	return rootFolders, nil
 }
 
-// CreateRootFolder creates root folder for user
-func (s *FolderService) CreateRootFolder(ctx context.Context, userID primitive.ObjectID) (*models.Folder, error) {
-	// Check if root folder already exists
-	if rootFolder, err := s.folderRepo.GetRootFolder(ctx, userID); err == nil {
-		return rootFolder, nil
-	}
-
-	// Create root folder
-	folder := &models.Folder{
-		Name:     "My Files",
-		Path:     "/",
-		UserID:   userID,
-		IsRoot:   true,
-		IsPublic: false,
-	}
-
-	if err := s.folderRepo.Create(ctx, folder); err != nil {
-		return nil, err
-	}
-
-	return folder, nil
-}
-
 // UpdateFolder updates folder metadata
 func (s *FolderService) UpdateFolder(ctx context.Context, userID primitive.ObjectID, folderID primitive.ObjectID, updates map[string]interface{}) (*models.Folder, error) {
 	// Get folder and verify ownership
@@ -259,6 +263,9 @@ func (s *FolderService) UpdateFolder(ctx context.Context, userID primitive.Objec
 		delete(updates, "path")
 		delete(updates, "parent_id")
 	}
+
+	// Add updated timestamp
+	updates["updated_at"] = time.Now()
 
 	// Update folder
 	if err := s.folderRepo.Update(ctx, folderID, updates); err != nil {
@@ -408,7 +415,7 @@ func (s *FolderService) MoveFolder(ctx context.Context, userID primitive.ObjectI
 	return s.folderRepo.GetByID(ctx, folderID)
 }
 
-// DeleteFolder deletes a folder and all its contents
+// DeleteFolder deletes a folder (soft delete)
 func (s *FolderService) DeleteFolder(ctx context.Context, userID primitive.ObjectID, folderID primitive.ObjectID) error {
 	// Get folder and verify ownership
 	folder, err := s.folderRepo.GetByID(ctx, folderID)
@@ -466,64 +473,407 @@ func (s *FolderService) DeleteFolder(ctx context.Context, userID primitive.Objec
 	return nil
 }
 
+// CreateRootFolder creates root folder for user
+func (s *FolderService) CreateRootFolder(ctx context.Context, userID primitive.ObjectID) (*models.Folder, error) {
+	// Check if root folder already exists
+	if rootFolder, err := s.folderRepo.GetRootFolder(ctx, userID); err == nil {
+		return rootFolder, nil
+	}
+
+	// Create root folder
+	folder := &models.Folder{
+		Name:     "My Files",
+		Path:     "/",
+		UserID:   userID,
+		IsRoot:   true,
+		IsPublic: false,
+	}
+
+	if err := s.folderRepo.Create(ctx, folder); err != nil {
+		return nil, err
+	}
+
+	return folder, nil
+}
+
+// ============================================================================
+// ADDITIONAL FOLDER OPERATIONS
+// ============================================================================
+
+// ToggleFavorite toggles folder favorite status
+func (s *FolderService) ToggleFavorite(ctx context.Context, userID primitive.ObjectID, folderID primitive.ObjectID) (*models.Folder, error) {
+	// Get folder and verify ownership
+	folder, err := s.folderRepo.GetByID(ctx, folderID)
+	if err != nil {
+		return nil, err
+	}
+
+	if folder.UserID != userID {
+		return nil, pkg.ErrForbidden
+	}
+
+	// Toggle favorite status
+	updates := map[string]interface{}{
+		"is_favorite": !folder.IsFavorite,
+		"updated_at":  time.Now(),
+	}
+
+	if err := s.folderRepo.Update(ctx, folderID, updates); err != nil {
+		return nil, err
+	}
+
+	// Log audit event
+	action := "favorited"
+	if folder.IsFavorite {
+		action = "unfavorited"
+	}
+	s.logAuditEvent(ctx, userID, models.AuditActionFolderUpdate, "folder", folderID, true, fmt.Sprintf("Folder %s", action))
+
+	// Get updated folder
+	return s.folderRepo.GetByID(ctx, folderID)
+}
+
+// CopyFolder creates a copy of a folder
+func (s *FolderService) CopyFolder(ctx context.Context, userID primitive.ObjectID, folderID primitive.ObjectID, targetParentID *primitive.ObjectID, newName string) (*models.Folder, error) {
+	// Get source folder and verify ownership
+	sourceFolder, err := s.folderRepo.GetByID(ctx, folderID)
+	if err != nil {
+		return nil, err
+	}
+
+	if sourceFolder.UserID != userID {
+		return nil, pkg.ErrForbidden
+	}
+
+	// Use original name if no new name provided
+	if newName == "" {
+		newName = sourceFolder.Name + " (Copy)"
+	}
+
+	// Create copy request
+	copyReq := &CreateFolderRequest{
+		Name:        newName,
+		ParentID:    targetParentID,
+		Description: sourceFolder.Description,
+		Color:       sourceFolder.Color,
+		Tags:        sourceFolder.Tags,
+		IsPublic:    false, // Copies are private by default
+	}
+
+	// Create the copy
+	return s.CreateFolder(ctx, userID, copyReq)
+}
+
+// ForceDeleteFolder deletes folder and all its contents
+func (s *FolderService) ForceDeleteFolder(ctx context.Context, userID primitive.ObjectID, folderID primitive.ObjectID) error {
+	// Get folder and verify ownership
+	folder, err := s.folderRepo.GetByID(ctx, folderID)
+	if err != nil {
+		return err
+	}
+
+	if folder.UserID != userID {
+		return pkg.ErrForbidden
+	}
+
+	if folder.IsRoot {
+		return pkg.ErrForbidden.WithDetails(map[string]interface{}{
+			"message": "Cannot delete root folder",
+		})
+	}
+
+	// Delete all files in folder
+	files, _, err := s.fileRepo.ListByFolder(ctx, folderID, &pkg.PaginationParams{Page: 1, Limit: 1000})
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		s.fileRepo.SoftDelete(ctx, file.ID)
+	}
+
+	// Delete all subfolders recursively
+	subfolders, err := s.folderRepo.ListByParent(ctx, folderID)
+	if err != nil {
+		return err
+	}
+
+	for _, subfolder := range subfolders {
+		s.ForceDeleteFolder(ctx, userID, subfolder.ID)
+	}
+
+	// Delete the folder itself
+	return s.DeleteFolder(ctx, userID, folderID)
+}
+
+// RestoreFolder restores a deleted folder
+func (s *FolderService) RestoreFolder(ctx context.Context, userID primitive.ObjectID, folderID primitive.ObjectID) (*models.Folder, error) {
+	// Get folder (including deleted ones)
+	folder, err := s.folderRepo.GetByID(ctx, folderID)
+	if err != nil {
+		return nil, err
+	}
+
+	if folder.UserID != userID {
+		return nil, pkg.ErrForbidden
+	}
+
+	if folder.DeletedAt == nil {
+		return nil, pkg.ErrInvalidInput.WithDetails(map[string]interface{}{
+			"message": "Folder is not deleted",
+		})
+	}
+
+	// Restore folder
+	updates := map[string]interface{}{
+		"deleted_at": nil,
+		"updated_at": time.Now(),
+	}
+
+	if err := s.folderRepo.Update(ctx, folderID, updates); err != nil {
+		return nil, err
+	}
+
+	// Update parent folder count
+	if folder.ParentID != nil {
+		parentUpdates := map[string]interface{}{
+			"folder_count": 1,
+		}
+		s.folderRepo.Update(ctx, *folder.ParentID, parentUpdates)
+	}
+
+	// Log audit event
+	s.logAuditEvent(ctx, userID, models.AuditActionFolderUpdate, "folder", folderID, true, "Folder restored")
+
+	return s.folderRepo.GetByID(ctx, folderID)
+}
+
+// GetFolderStatistics calculates detailed folder statistics
+func (s *FolderService) GetFolderStatistics(ctx context.Context, userID primitive.ObjectID, folderID primitive.ObjectID) (*FolderStatistics, error) {
+	// Verify folder ownership
+	folder, err := s.GetFolder(ctx, userID, folderID)
+	if err != nil {
+		return nil, err
+	}
+
+	stats := &FolderStatistics{
+		TotalFiles:   folder.FileCount,
+		TotalFolders: folder.FolderCount,
+		TotalSize:    folder.Size,
+		ShareCount:   folder.ShareCount,
+		LastModified: folder.UpdatedAt,
+	}
+
+	// Calculate file types distribution
+	// This would require a more complex query in a real implementation
+	stats.FilesByType = make(map[string]int64)
+	stats.FilesByType["document"] = 0
+	stats.FilesByType["image"] = 0
+	stats.FilesByType["video"] = 0
+	stats.FilesByType["audio"] = 0
+	stats.FilesByType["other"] = 0
+
+	return stats, nil
+}
+
+// GetFavoriteFolders retrieves user's favorite folders
+func (s *FolderService) GetFavoriteFolders(ctx context.Context, userID primitive.ObjectID, params *pkg.PaginationParams) ([]*models.Folder, int64, error) {
+	// Add favorite filter
+	originalFilter := params.Filter
+	if originalFilter == nil {
+		originalFilter = make(map[string]interface{})
+	}
+
+	params.Filter = map[string]interface{}{
+		"user_id":     userID,
+		"is_favorite": true,
+		"deleted_at":  nil,
+	}
+
+	// Merge with existing filters
+	for k, v := range originalFilter {
+		params.Filter[k] = v
+	}
+
+	return s.folderRepo.ListByUser(ctx, userID, params)
+}
+
+// GetRootFolders retrieves user's root folders (folders with no parent)
+func (s *FolderService) GetRootFolders(ctx context.Context, userID primitive.ObjectID, params *pkg.PaginationParams) ([]*models.Folder, int64, error) {
+	// Add root filter
+	originalFilter := params.Filter
+	if originalFilter == nil {
+		originalFilter = make(map[string]interface{})
+	}
+
+	params.Filter = map[string]interface{}{
+		"user_id":    userID,
+		"parent_id":  nil,
+		"deleted_at": nil,
+	}
+
+	// Merge with existing filters
+	for k, v := range originalFilter {
+		params.Filter[k] = v
+	}
+
+	return s.folderRepo.ListByUser(ctx, userID, params)
+}
+
+// GetDeletedFolders retrieves user's deleted folders
+func (s *FolderService) GetDeletedFolders(ctx context.Context, userID primitive.ObjectID, params *pkg.PaginationParams) ([]*models.Folder, int64, error) {
+	// This would need a special repository method to include deleted folders
+	// For now, return empty result
+	return []*models.Folder{}, 0, nil
+}
+
+// EmptyTrash permanently deletes all deleted folders
+func (s *FolderService) EmptyTrash(ctx context.Context, userID primitive.ObjectID) (int64, error) {
+	// This would need a repository method to permanently delete all soft-deleted folders
+	// For now, return 0
+	return 0, nil
+}
+
+// ============================================================================
+// BULK OPERATIONS
+// ============================================================================
+
+// BulkDeleteFolders deletes multiple folders
+func (s *FolderService) BulkDeleteFolders(ctx context.Context, userID primitive.ObjectID, folderIDs []primitive.ObjectID) (*BulkOperationResult, error) {
+	result := &BulkOperationResult{
+		Successful: make([]string, 0),
+		Failed:     make([]map[string]interface{}, 0),
+		Total:      len(folderIDs),
+	}
+
+	for _, folderID := range folderIDs {
+		err := s.DeleteFolder(ctx, userID, folderID)
+		if err != nil {
+			result.Failed = append(result.Failed, map[string]interface{}{
+				"id":    folderID.Hex(),
+				"error": err.Error(),
+			})
+		} else {
+			result.Successful = append(result.Successful, folderID.Hex())
+		}
+	}
+
+	return result, nil
+}
+
+// BulkMoveFolders moves multiple folders to a new parent
+func (s *FolderService) BulkMoveFolders(ctx context.Context, userID primitive.ObjectID, folderIDs []primitive.ObjectID, targetParentID primitive.ObjectID) (*BulkOperationResult, error) {
+	result := &BulkOperationResult{
+		Successful: make([]string, 0),
+		Failed:     make([]map[string]interface{}, 0),
+		Total:      len(folderIDs),
+	}
+
+	for _, folderID := range folderIDs {
+		_, err := s.MoveFolder(ctx, userID, folderID, &targetParentID)
+		if err != nil {
+			result.Failed = append(result.Failed, map[string]interface{}{
+				"id":    folderID.Hex(),
+				"error": err.Error(),
+			})
+		} else {
+			result.Successful = append(result.Successful, folderID.Hex())
+		}
+	}
+
+	return result, nil
+}
+
+// ============================================================================
+// HELPER METHODS
+// ============================================================================
+
 // updateFolderPaths updates folder and all its contents paths
 func (s *FolderService) updateFolderPaths(ctx context.Context, folder *models.Folder, newName, newPath string) error {
-	oldPath := folder.Path
-
 	// Update current folder
 	updates := map[string]interface{}{
-		"name": newName,
-		"path": newPath,
+		"name":       newName,
+		"path":       newPath,
+		"updated_at": time.Now(),
 	}
 
 	if err := s.folderRepo.Update(ctx, folder.ID, updates); err != nil {
 		return err
 	}
 
-	// Update all subfolders paths
-	subfolders, err := s.folderRepo.GetFolderTree(ctx, folder.UserID)
+	// Update all subfolders paths recursively
+	subfolders, err := s.folderRepo.ListByParent(ctx, folder.ID)
 	if err != nil {
 		return err
 	}
 
 	for _, subfolder := range subfolders {
-		if strings.HasPrefix(subfolder.Path, oldPath+"/") {
-			newSubPath := strings.Replace(subfolder.Path, oldPath, newPath, 1)
-			subUpdates := map[string]interface{}{
-				"path": newSubPath,
-			}
-			s.folderRepo.Update(ctx, subfolder.ID, subUpdates)
+		newSubPath := newPath + "/" + subfolder.Name
+		if err := s.updateFolderPaths(ctx, subfolder, subfolder.Name, newSubPath); err != nil {
+			return err
 		}
 	}
 
-	// Update all files paths in this folder and subfolders
-	// This would require iterating through all files - simplified for brevity
+	// Update all files paths in this folder
+	files, _, err := s.fileRepo.ListByFolder(ctx, folder.ID, &pkg.PaginationParams{Page: 1, Limit: 1000})
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		newFilePath := newPath + "/" + file.Name
+		fileUpdates := map[string]interface{}{
+			"path":       newFilePath,
+			"updated_at": time.Now(),
+		}
+		s.fileRepo.Update(ctx, file.ID, fileUpdates)
+	}
 
 	return nil
 }
 
-// isFolderDescendant checks if targetID is a descendant of folderID
-func (s *FolderService) isFolderDescendant(ctx context.Context, folderID, targetID primitive.ObjectID) bool {
-	if folderID == targetID {
+// isFolderDescendant checks if target is a descendant of source folder
+func (s *FolderService) isFolderDescendant(ctx context.Context, sourceFolderID, targetFolderID primitive.ObjectID) bool {
+	if sourceFolderID == targetFolderID {
 		return true
 	}
 
-	// Get target folder
-	target, err := s.folderRepo.GetByID(ctx, targetID)
-	if err != nil {
-		return false
-	}
-
-	// Check if target's parent is the folder or its descendant
-	if target.ParentID != nil {
-		return s.isFolderDescendant(ctx, folderID, *target.ParentID)
+	// Get all descendants of source folder
+	descendants := s.getAllDescendants(ctx, sourceFolderID)
+	for _, descendant := range descendants {
+		if descendant == targetFolderID {
+			return true
+		}
 	}
 
 	return false
 }
 
+// getAllDescendants gets all descendant folder IDs
+func (s *FolderService) getAllDescendants(ctx context.Context, folderID primitive.ObjectID) []primitive.ObjectID {
+	var descendants []primitive.ObjectID
+
+	subfolders, err := s.folderRepo.ListByParent(ctx, folderID)
+	if err != nil {
+		return descendants
+	}
+
+	for _, subfolder := range subfolders {
+		descendants = append(descendants, subfolder.ID)
+		// Recursively get descendants
+		subDescendants := s.getAllDescendants(ctx, subfolder.ID)
+		descendants = append(descendants, subDescendants...)
+	}
+
+	return descendants
+}
+
 // logAuditEvent logs an audit event
 func (s *FolderService) logAuditEvent(ctx context.Context, userID primitive.ObjectID, action models.AuditAction, resourceType string, resourceID primitive.ObjectID, success bool, message string) {
+	if s.auditRepo == nil {
+		return
+	}
+
 	auditLog := &models.AuditLog{
 		UserID:    &userID,
 		Action:    action,
@@ -538,11 +888,18 @@ func (s *FolderService) logAuditEvent(ctx context.Context, userID primitive.Obje
 		auditLog.Severity = models.AuditSeverityMedium
 	}
 
-	s.auditRepo.Create(ctx, auditLog)
+	// Log audit event in background
+	go func() {
+		s.auditRepo.Create(context.Background(), auditLog)
+	}()
 }
 
 // trackAnalytics tracks analytics event
-func (s *FolderService) trackAnalytics(ctx context.Context, userID primitive.ObjectID, eventType models.AnalyticsEventType, action string, resourceID primitive.ObjectID, resourceName string) {
+func (s *FolderService) trackAnalytics(_ context.Context, userID primitive.ObjectID, eventType models.AnalyticsEventType, action string, resourceID primitive.ObjectID, resourceName string) {
+	if s.analyticsRepo == nil {
+		return
+	}
+
 	analytics := &models.Analytics{
 		UserID:    &userID,
 		EventType: eventType,
@@ -553,7 +910,11 @@ func (s *FolderService) trackAnalytics(ctx context.Context, userID primitive.Obj
 			Name: resourceName,
 		},
 		Timestamp: time.Now(),
+		Metadata:  make(map[string]interface{}),
 	}
 
-	s.analyticsRepo.Create(ctx, analytics)
+	// Track analytics in background
+	go func() {
+		s.analyticsRepo.Create(context.Background(), analytics)
+	}()
 }
